@@ -8,13 +8,16 @@ through signed links, and the bucket gets no ACL.
 
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from app.core.config import Settings
 from app.media.signing import is_media_key
 
-S3_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# A HEAD has no body, so a missing key comes back as "404". Some S3-compatible stores answer 403 to
+# a HEAD for a missing key when the credentials lack ListBucket, so 403 is "not known to exist" too.
+S3_NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound", "403"})
 
 
 class MediaWriteError(Exception):
@@ -22,12 +25,29 @@ class MediaWriteError(Exception):
 
 
 class MediaWriter(Protocol):
+    # "local" or "s3": where the files go, for the IGDB image gate (AC-2).
+    kind: str
+
     def exists(self, key: str) -> bool: ...
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
         """Store the file at `path` under `key`. Returns False and writes nothing when the key is
         already there (AC-41)."""
         ...
+
+
+def write_atomically(path: Path, write: Callable[[BinaryIO], None]) -> None:
+    """Fill a temp file beside `path` with `write`, then move it into place with `os.replace`, so a
+    reader never sees half a file. A failure removes the temp file and leaves `path` as it was."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=".part-")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            write(out)
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 def _checked_key(key: str) -> str:
@@ -38,6 +58,8 @@ def _checked_key(key: str) -> str:
 
 
 class LocalMediaWriter:
+    kind = "local"
+
     def __init__(self, directory: Path) -> None:
         self.directory = directory
 
@@ -47,21 +69,19 @@ class LocalMediaWriter:
     def put(self, key: str, path: Path, content_type: str) -> bool:
         if self.exists(key):
             return False
-        self.directory.mkdir(parents=True, exist_ok=True)
-        # Written beside the target and moved into place, so a reader never sees half a file.
-        handle, temp_name = tempfile.mkstemp(dir=self.directory, prefix=".put-")
-        try:
-            with os.fdopen(handle, "wb") as out, path.open("rb") as source:
+
+        def copy(out: BinaryIO) -> None:
+            with path.open("rb") as source:
                 while chunk := source.read(1024 * 1024):
                     out.write(chunk)
-            os.replace(temp_name, self.directory / key)
-        except BaseException:
-            Path(temp_name).unlink(missing_ok=True)
-            raise
+
+        write_atomically(self.directory / key, copy)
         return True
 
 
 class S3MediaWriter:
+    kind = "s3"
+
     def __init__(
         self,
         *,
@@ -86,23 +106,45 @@ class S3MediaWriter:
         )
 
     def exists(self, key: str) -> bool:
-        from botocore.exceptions import ClientError
+        """True when the bucket says the key is there. A 403 on a HEAD is "not known to exist": the
+        store may hide a missing key from credentials without ListBucket. `put` is content-addressed,
+        so writing the same bytes again is harmless."""
+        from botocore.exceptions import BotoCoreError, ClientError
 
         try:
             self.client.head_object(Bucket=self.bucket, Key=_checked_key(key))
         except ClientError as error:
-            if error.response.get("Error", {}).get("Code") in S3_MISSING_CODES:
+            if error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_CODES:
                 return False
-            raise
+            raise MediaWriteError(f"the bucket refused a HEAD: {_code(error)}") from error
+        except BotoCoreError as error:
+            raise MediaWriteError(
+                f"the bucket cannot be reached: {type(error).__name__}"
+            ) from error
         return True
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
+        from botocore.exceptions import BotoCoreError, ClientError
+
         if self.exists(key):
             return False
-        with path.open("rb") as body:
-            # No `ACL`: the bucket's default (private) holds.
-            self.client.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType=content_type)
+        try:
+            with path.open("rb") as body:
+                # No `ACL`: the bucket's default (private) holds.
+                self.client.put_object(
+                    Bucket=self.bucket, Key=key, Body=body, ContentType=content_type
+                )
+        except ClientError as error:
+            raise MediaWriteError(f"the bucket refused a PUT: {_code(error)}") from error
+        except BotoCoreError as error:
+            raise MediaWriteError(
+                f"the bucket cannot be reached: {type(error).__name__}"
+            ) from error
         return True
+
+
+def _code(error: Any) -> str:
+    return str(error.response.get("Error", {}).get("Code", "unknown"))
 
 
 def build_media_writer(app_settings: Settings) -> MediaWriter:

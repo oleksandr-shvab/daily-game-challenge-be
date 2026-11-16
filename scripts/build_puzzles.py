@@ -40,23 +40,27 @@ import logging
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
-from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.exc import SQLAlchemyError
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.content.builder import (
+    MAX_SLOTS_PER_RUN,
     Builder,
     BuildReport,
+    DatabaseFailure,
+    GiveUpError,
     ImageFetcher,
     SlotRequest,
     UnknownGameError,
+    database_errors,
     give_up_slot,
 )
 from app.content.candidates import (
@@ -114,11 +118,12 @@ async def run_counts(settings: ContentSettings, slug: str) -> CountsReport:
     try:
         now = get_now()
         async with async_session_maker() as db:
-            game = await get_game_by_slug(db, slug)
-            if game is None:
-                raise UnknownGameError(f"no game with the slug {slug!r} in the database")
-            earlier = await list_answer_igdb_ids(db, game.id)
-            exclusions = await list_exclusions(db, game.id)
+            with database_errors():
+                game = await get_game_by_slug(db, slug)
+                if game is None:
+                    raise UnknownGameError(f"no game with the slug {slug!r} in the database")
+                earlier = await list_answer_igdb_ids(db, game.id)
+                exclusions = await list_exclusions(db, game.id)
         counter = FunnelCounter(
             today=utc_today(now),
             settings=settings,
@@ -148,18 +153,34 @@ def parse_slots(text: str) -> range:
     last = int(match.group(2) or first)
     if first < 1 or last < first:
         raise argparse.ArgumentTypeError("slots start at 1 and A-B needs A <= B")
+    if last - first + 1 > MAX_SLOTS_PER_RUN:
+        raise argparse.ArgumentTypeError(f"a run builds at most {MAX_SLOTS_PER_RUN} slots")
     return range(first, last + 1)
 
 
-def positive_int(text: str) -> int:
-    if not text.isascii() or not text.isdigit() or int(text) < 1:
-        raise argparse.ArgumentTypeError("use a whole number of at least 1")
-    return int(text)
+def bounded_int(low: int, high: int) -> Callable[[str], int]:
+    """An argparse type: plain digits, from `low` to `high`."""
+
+    def parse(text: str) -> int:
+        if not text.isascii() or not text.isdigit() or not low <= int(text) <= high:
+            raise argparse.ArgumentTypeError(f"use a whole number from {low} to {high}")
+        return int(text)
+
+    return parse
+
+
+# Slot numbers are six digits at most, as in `--slots`.
+slot_number = bounded_int(1, 999_999)
+slot_count = bounded_int(1, MAX_SLOTS_PER_RUN)
 
 
 async def run_build(
-    settings: ContentSettings, args: argparse.Namespace, request: SlotRequest
-) -> BuildReport:
+    settings: ContentSettings,
+    args: argparse.Namespace,
+    request: SlotRequest,
+    report: BuildReport,
+) -> None:
+    """Fills `report` slot by slot, so a run that stops half way still shows what it finished."""
     from app.core.config import settings as app_settings
     from app.core.db import async_session_maker, engine
 
@@ -183,7 +204,7 @@ async def run_build(
                 writer=writer,
                 dry_run=args.dry_run,
             )
-            return await builder.run(request)
+            await builder.run(request, report)
     finally:
         await engine.dispose()
 
@@ -209,14 +230,14 @@ def build_parser() -> argparse.ArgumentParser:
     modes = parser.add_argument_group("build modes (exactly one)")
     modes.add_argument("--slots", type=parse_slots, metavar="A-B", help="build these slots")
     modes.add_argument(
-        "--next", type=positive_int, metavar="N", help="build the next N slots after the highest"
+        "--next", type=slot_count, metavar="N", help="build the next N slots after the highest"
     )
     modes.add_argument("--rebuilds", action="store_true", help="build the slots waiting for one")
     parser.add_argument("--dry-run", action="store_true", help="do everything but write")
     parser.add_argument("--show-answers", action="store_true", help="print the answers' names")
     parser.add_argument(
         "--give-up",
-        type=positive_int,
+        type=slot_number,
         metavar="SLOT",
         help="give up rebuilding SLOT: its title is excluded for good and the slot is free",
     )
@@ -237,6 +258,15 @@ def main() -> int:
     # httpx logs every request URL at INFO; keep the run quiet.
     logging.basicConfig(level=logging.WARNING)
     settings = ContentSettings()
+    report = BuildReport()
+
+    def stop(message: str) -> int:
+        """The run ends early: show the slots it already finished, then why it stopped."""
+        if report.outcomes:
+            print("\n".join(report.lines(show_answers=args.show_answers)))
+        print(f"build_puzzles: {message}", file=sys.stderr)
+        return 1
+
     try:
         if args.counts:
             settings.require("IGDB_CLIENT_ID", "IGDB_CLIENT_SECRET")
@@ -261,23 +291,30 @@ def main() -> int:
                 else f"slot {args.give_up}: no rebuild rows to give up; nothing changed"
             )
             return 0
-        check_image_gate(args.target, settings.IGDB_IMAGES_CLEARED_BY)
+        from app.core.config import settings as app_settings
+
+        check_image_gate(args.target, settings.IGDB_IMAGES_CLEARED_BY, app_settings.MEDIA_STORAGE)
         settings.require("IGDB_CLIENT_ID", "IGDB_CLIENT_SECRET")
         request = SlotRequest(slots=args.slots, next_count=args.next, rebuilds=args.rebuilds)
-        report = asyncio.run(run_build(settings, args, request))
-    except (TargetRefusedError, MissingSettingError, SaltError, UnknownGameError) as error:
-        print(f"build_puzzles: refusing to run: {error}", file=sys.stderr)
-        return 1
+        asyncio.run(run_build(settings, args, request, report))
+    except (
+        TargetRefusedError,
+        MissingSettingError,
+        SaltError,
+        UnknownGameError,
+        GiveUpError,
+    ) as error:
+        return stop(f"refusing to run: {error}")
     except (IgdbError, FetchError, httpx.HTTPError) as error:
-        print(f"build_puzzles: {error}", file=sys.stderr)
-        return 1
-    except SQLAlchemyError as error:
+        return stop(str(error))
+    except (DatabaseFailure, SQLAlchemyError) as error:
         # The draft being written was rolled back; drafts of earlier slots stay.
-        print(f"build_puzzles: database error: {type(error).__name__}", file=sys.stderr)
-        return 1
-    except (MediaWriteError, BotoCoreError, ClientError, OSError) as error:
-        print(f"build_puzzles: storage or file error: {type(error).__name__}", file=sys.stderr)
-        return 1
+        return stop(
+            f"database error: {error if isinstance(error, DatabaseFailure) else type(error).__name__}"
+        )
+    except (MediaWriteError, OSError) as error:
+        # Database errors were named above, where the database calls are made.
+        return stop(f"storage or file error: {type(error).__name__}")
     if args.dry_run:
         print("Dry run: nothing was written to the database or storage.")
     print("\n".join(report.lines(show_answers=args.show_answers)))

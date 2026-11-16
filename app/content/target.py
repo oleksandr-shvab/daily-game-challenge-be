@@ -89,14 +89,15 @@ def check_target(
     return Target(name=target, database_host=host, storage=_storage_description(app_settings))
 
 
-def check_image_gate(target: str, cleared_by: str | None) -> None:
-    """No IGDB screenshot leaves `local` while `IGDB_IMAGES_CLEARED_BY` is empty (R-12, AC-2).
-    Raise `TargetRefusedError` for any other target then. Every script that stores an IGDB
-    screenshot (the builder, promote) calls this before it fetches or writes anything."""
-    if target != LOCAL_TARGET and not (cleared_by or "").strip():
+def check_image_gate(target: str, cleared_by: str | None, storage: str = LOCAL_TARGET) -> None:
+    """No IGDB screenshot leaves `local` while `IGDB_IMAGES_CLEARED_BY` is empty (R-12, AC-2): not
+    to another target, and not to a bucket from the target `local` either (`storage` is the kind of
+    the storage the files go to, "local" or "s3"). Raise `TargetRefusedError` then. Every script that
+    stores an IGDB screenshot (the builder, promote) calls this before it fetches or writes."""
+    if (target != LOCAL_TARGET or storage != LOCAL_TARGET) and not (cleared_by or "").strip():
         raise TargetRefusedError(
-            f"IGDB images may not go to {target!r} while IGDB_IMAGES_CLEARED_BY is empty"
-            " (AC-2): build and review in 'local'"
+            f"IGDB images may not go to target {target!r} with {storage!r} storage while"
+            " IGDB_IMAGES_CLEARED_BY is empty (AC-2): build and review in 'local' with local storage"
         )
 
 
