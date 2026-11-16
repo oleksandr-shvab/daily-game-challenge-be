@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from PIL import Image
 from pydantic import SecretStr
 from sqlalchemy import delete, func, select
@@ -31,19 +31,24 @@ from app.content import builder as builder_module
 from app.content import media
 from app.content.builder import (
     GENERATOR_VERSION,
+    MAX_SLOT_NUMBER,
     Builder,
     BuildReport,
+    DatabaseFailure,
     GiveUpError,
     ImageFetcher,
+    ImageHostUnavailableError,
     ImageUnavailableError,
+    SlotLimitError,
     SlotOutcome,
     SlotRequest,
     SlotStatus,
+    database_session,
     give_up_slot,
 )
 from app.content.candidates import never_igdb_ids
 from app.content.fetch import ForbiddenHostError, ResponseTooLargeError
-from app.content.igdb import IgdbGame, parse_game
+from app.content.igdb import MAX_RETRIES, IgdbError, IgdbGame, parse_game
 from app.content.seed import TEST_SALT, SaltError
 from app.content.settings import ContentSettings
 from app.content.target import TargetRefusedError
@@ -95,9 +100,15 @@ class FakeIgdb:
     """The games source of a run. `calls` counts how often a run asked IGDB to be read, and
     `in_transaction` says whether the database session had a transaction open each time."""
 
-    def __init__(self, games: list[IgdbGame], db: AsyncSession | None = None) -> None:
+    def __init__(
+        self,
+        games: list[IgdbGame],
+        db: AsyncSession | None = None,
+        fail: Exception | None = None,
+    ) -> None:
         self.games = games
         self.db = db
+        self.fail = fail
         self.calls = 0
         self.in_transaction: list[bool] = []
 
@@ -108,6 +119,8 @@ class FakeIgdb:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[IgdbGame]:
+        if self.fail is not None:
+            raise self.fail
         for game in self.games:
             yield game
 
@@ -414,10 +427,11 @@ async def test__build__a_draft_that_breaks_the_media_rule_fails_its_slot_not_the
 @pytest.mark.parametrize(
     ("error", "stops_the_run"),
     [
-        (ImageUnavailableError("IGDB's image host answered 404"), False),
+        (ImageUnavailableError("IGDB's image host does not have it (404)"), False),
         (ForbiddenHostError("x"), True),
+        (ImageHostUnavailableError("IGDB's image host is unavailable: 503"), True),
     ],
-    ids=["one_image_missing", "host_refused"],
+    ids=["one_image_missing", "host_refused", "host_down"],
 )
 async def test__build__a_missing_image_fails_its_slot_but_a_refused_host_stops_the_run(
     env: Env, error: Exception, stops_the_run: bool
@@ -427,7 +441,7 @@ async def test__build__a_missing_image_fails_its_slot_but_a_refused_host_stops_t
     report = BuildReport()
 
     if stops_the_run:
-        with pytest.raises(ForbiddenHostError):
+        with pytest.raises(type(error)):
             await builder.run(SlotRequest(slots=range(1, 3)), report)
         assert report.outcomes == []
         return
@@ -455,7 +469,8 @@ async def test__build__a_run_that_stops_keeps_the_report_of_the_slots_it_finishe
 
     report = BuildReport()
 
-    with pytest.raises(OSError, match="disk is full"):
+    # The storage error is named a `MediaWriteError` where the file is put.
+    with pytest.raises(MediaWriteError, match="OSError"):
         await env.builder(
             FakeIgdb([make_game(1), make_game(2)]), writer=FailingWriter(env.storage)
         ).run(SlotRequest(slots=range(1, 3)), report)
@@ -586,7 +601,7 @@ def test__build_script__refuses_a_size_it_cannot_run_as_a_usage_error(
 
 
 async def test__give_up_slot__refuses_rows_that_name_two_titles_and_changes_nothing(
-    env: Env,
+    env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first, second = (
         await create_title(env.db, name="One", igdb_id=1),
@@ -605,8 +620,15 @@ async def test__give_up_slot__refuses_rows_that_name_two_titles_and_changes_noth
         )
     await env.db.commit()
 
+    async def broken_rollback() -> None:
+        raise OSError("the connection is gone")
+
+    real_rollback = env.db.rollback
+    monkeypatch.setattr(env.db, "rollback", broken_rollback)
+    # A rollback that fails too does not replace the refusal.
     with pytest.raises(GiveUpError, match="more than one title"):
         await give_up_slot(env.db, "game-guesser", 4)
+    monkeypatch.setattr(env.db, "rollback", real_rollback)
 
     assert [row.reason for row in await list_exclusions(env.db, env.game_id)] == ["rebuild"] * 2
 
@@ -643,18 +665,25 @@ def test__build_script__a_database_that_is_down_is_a_database_error_not_a_file_e
 
 
 @pytest.mark.parametrize(
-    ("raised", "message"),
+    ("raised", "message", "extra_argv"),
     [
-        (OSError("disk"), "storage or file error: OSError"),
-        (GiveUpError("slot 4 names two titles"), "refusing to run: slot 4 names two titles"),
+        (OSError("disk"), "storage or file error: OSError", []),
+        (MediaWriteError("a file cannot be stored: OSError"), "storage or file error: a file", []),
+        (IgdbError("IGDB is unavailable"), "IGDB is unavailable", []),
+        (DatabaseFailure("ConnectionRefusedError"), "database error: ConnectionRefused", []),
+        (SlotLimitError("past slot 999999"), "refusing to run: past slot 999999", []),
+        (IgdbError("IGDB is unavailable"), "IGDB is unavailable", ["--dry-run"]),
+        (RuntimeError("a bug"), None, []),
+        (KeyboardInterrupt(), None, []),
     ],
-    ids=["storage", "give_up_conflict"],
+    ids=["oserror", "media", "igdb", "database", "slot_limit", "dry_run", "a_bug", "ctrl_c"],
 )
-def test__build_script__a_run_that_stops_prints_its_finished_slots_then_the_error(
+def test__build_script__a_run_that_stops_prints_what_it_finished_then_the_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    raised: Exception,
-    message: str,
+    raised: BaseException,
+    message: str | None,
+    extra_argv: list[str],
 ) -> None:
     for name, value in {
         "ENVIRONMENT": "local",
@@ -669,25 +698,44 @@ def test__build_script__a_run_that_stops_prints_its_finished_slots_then_the_erro
         report = args[-1]
         report.slots = [1, 2]
         report.outcomes.append(SlotOutcome(1, SlotStatus.BUILT))
-        raise raised
-
-    async def gives_up(*args: Any) -> int:
+        report.given_up.append(5)
         raise raised
 
     monkeypatch.setattr(script, "run_build", stops_after_slot_one)
-    monkeypatch.setattr(script, "run_give_up", gives_up)
-    argv = (
-        ["--target", "local", "--give-up", "4"]
-        if isinstance(raised, GiveUpError)
-        else ["--target", "local", "--next", "2"]
+    monkeypatch.setattr(
+        "sys.argv", ["build_puzzles.py", "--target", "local", "--next", "2", *extra_argv]
     )
-    monkeypatch.setattr("sys.argv", ["build_puzzles.py", *argv])
 
-    code = script.main()
+    if message is None:  # Not an error the script names: it is raised again after the report.
+        with pytest.raises(type(raised)):
+            script.main()
+        code = None
+    else:
+        code = script.main()
 
     captured = capsys.readouterr()
-    assert code == 1 and message in captured.err
-    assert ("slot 1: built" in captured.out) == (not isinstance(raised, GiveUpError))
+    assert "slot 1: built" in captured.out
+    assert "slot 5: rebuild given up (title rejected as never)" in captured.out
+    assert ("Dry run: nothing was written" in captured.out) == bool(extra_argv)
+    if message is not None:
+        assert code == 1 and message in captured.err
+
+
+def test__build_script__a_give_up_conflict_is_a_refusal_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.delenv("CI", raising=False)
+    script = load_script()
+
+    async def conflict(*args: Any) -> int:
+        raise GiveUpError("the rebuild rows of slot 4 name more than one title")
+
+    monkeypatch.setattr(script, "run_give_up", conflict)
+    monkeypatch.setattr("sys.argv", ["build_puzzles.py", "--target", "local", "--give-up", "4"])
+
+    assert script.main() == 1
+    assert "refusing to run: the rebuild rows of slot 4" in capsys.readouterr().err
 
 
 def test__build_script__local_runs_never_load_botocore() -> None:
@@ -719,9 +767,11 @@ def test__build_script__local_runs_never_load_botocore() -> None:
         ("https://evil.example/{image_id}.jpg", ForbiddenHostError, 200, 10),
         ("http://images.igdb.com/{image_id}.jpg", ForbiddenHostError, 200, 10),
         (None, ResponseTooLargeError, 200, 5000),
-        (None, ImageUnavailableError, 302, 10),
+        (None, ImageHostUnavailableError, 302, 10),
+        (None, ImageUnavailableError, 404, 10),
+        (None, ImageUnavailableError, 410, 10),
     ],
-    ids=["ok", "foreign_host", "plain_http", "too_large", "redirect_is_not_followed"],
+    ids=["ok", "foreign_host", "plain_http", "too_large", "redirect_is_not_followed", "404", "410"],
 )
 async def test__image_fetcher__goes_only_to_the_image_host_within_the_size_cap(
     monkeypatch: pytest.MonkeyPatch,
@@ -750,8 +800,45 @@ async def test__image_fetcher__goes_only_to_the_image_host_within_the_size_cap(
         else:
             with pytest.raises(error):
                 await fetcher.fetch("abc123")
-            if error is ForbiddenHostError:
-                assert requests == []  # refused before the request left
+            # One request at most: none for a refused host, and no retry for anything but 429 or 5xx.
+            assert len(requests) == (0 if error is ForbiddenHostError else 1)
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected_sleeps", "error"),
+    [
+        ([503, 429, 200], [1.0, 7.0], None),
+        ([503] * (MAX_RETRIES + 1), [1.0, 2.0, 4.0, 8.0, 16.0], ImageHostUnavailableError),
+    ],
+    ids=["busy_then_fine", "stays_down"],
+)
+async def test__image_fetcher__retries_a_busy_host_in_bounds_and_gives_up_when_it_stays_down(
+    answers: list[int], expected_sleeps: list[float], error: type[Exception] | None
+) -> None:
+    left = list(answers)
+    requests: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = left.pop(0) if len(left) > 1 else left[0]
+        return httpx.Response(
+            status, content=b"image", headers={"Retry-After": "7"} if status == 429 else {}
+        )
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async with ImageFetcher(httpx.MockTransport(answer), sleep=sleep) as fetcher:
+        if error is None:
+            assert await fetcher.fetch("abc123") == b"image"
+        else:
+            with pytest.raises(error):
+                await fetcher.fetch("abc123")
+
+    # Bounded: the first try and at most MAX_RETRIES more, waiting as the IGDB client does, with
+    # Retry-After honoured.
+    assert (len(requests), sleeps) == (len(answers), expected_sleeps)
 
 
 # (d) Rebuilds, decision 71 and the give-up command ------------------------------------------
@@ -841,12 +928,14 @@ async def test__rebuild__avoids_every_rejected_screenshot_and_the_title_stays_in
     never_rows = len([r for r in await list_exclusions(env.db, env.game_id) if r.reason == "never"])
 
     planned = await env.builder(FakeIgdb(pool), dry_run=True).run(SlotRequest(rebuilds=True))
-    assert (planned.outcomes[0].status, planned.outcomes[0].given_up) == (SlotStatus.PLANNED, True)
+    assert planned.outcomes[0].status == SlotStatus.PLANNED
+    assert (planned.given_up, planned.would_give_up) == ([], [2])
     assert "would be given up (title rejected as never)" in "\n".join(planned.lines())
     assert [r.reason for r in await list_exclusions(env.db, env.game_id)].count("rebuild") == 1
 
     built = await env.builder(FakeIgdb(pool)).run(SlotRequest(rebuilds=True))
-    assert (built.outcomes[0].status, built.outcomes[0].given_up) == (SlotStatus.BUILT, True)
+    assert built.outcomes[0].status == SlotStatus.BUILT
+    assert (built.given_up, built.would_give_up) == ([2], [])
     assert not built.outcomes[0].is_rebuild
     assert "rebuild given up (title rejected as never)" in "\n".join(built.lines())
     rows = await list_exclusions(env.db, env.game_id)
@@ -854,6 +943,138 @@ async def test__rebuild__avoids_every_rejected_screenshot_and_the_title_stays_in
     assert [r.reason for r in rows].count("never") == never_rows
     replaced = await env.db.get(Title, (await puzzle_in_slot(env.db, 2)).answer_title_id)
     assert replaced is not None and replaced.id != rejected_title
+
+
+async def add_rebuild_rows(env: Env, slot: int, *titles: Title, never: Title | None = None) -> None:
+    """Rebuild rows of a slot for these titles, and a "never" row for `never`."""
+    for title in titles:
+        env.db.add(
+            AnswerExclusion(
+                game_id=env.game_id,
+                variant="default",
+                title_id=title.id,
+                reason="rebuild",
+                build_slot=slot,
+                image_ids=["a"],
+            )
+        )
+    if never is not None:
+        env.db.add(
+            AnswerExclusion(
+                game_id=env.game_id, variant="default", title_id=never.id, reason="never"
+            )
+        )
+    await env.db.commit()
+
+
+async def rows_by_reason(env: Env) -> dict[str, int]:
+    return dict(Counter(row.reason for row in await list_exclusions(env.db, env.game_id)))
+
+
+@pytest.mark.parametrize("is_dry_run", [False, True], ids=["real_run", "dry_run"])
+@pytest.mark.parametrize("stop", [False, True], ids=["slot_fails", "run_stops"])
+async def test__build__a_give_up_is_reported_when_it_happens_whatever_the_slot_does_next(
+    env: Env, is_dry_run: bool, stop: bool
+) -> None:
+    title = await create_title(env.db, name="Rejected", igdb_id=7)
+    await add_rebuild_rows(env, 5, title, never=title)
+    igdb = FakeIgdb([], fail=IgdbError("IGDB is unavailable") if stop else None)
+    report = BuildReport()
+
+    if stop:  # The give-up is committed before IGDB is read; a stop after it still shows it.
+        with pytest.raises(IgdbError):
+            await env.builder(igdb, dry_run=is_dry_run).run(SlotRequest(slots=range(5, 6)), report)
+    else:  # No candidate is left for the freed slot: it fails, the give-up is still reported.
+        await env.builder(igdb, dry_run=is_dry_run).run(SlotRequest(slots=range(5, 6)), report)
+        assert [(o.status, o.detail) for o in report.outcomes] == [
+            (SlotStatus.FAILED, "no_candidate")
+        ]
+
+    text = "\n".join(report.lines())
+    if is_dry_run:  # Only "would be given up", and nothing is written.
+        assert (report.given_up, report.would_give_up) == ([], [5])
+        assert "rebuild given up" not in text and "would be given up" in text
+        assert await rows_by_reason(env) == {"rebuild": 1, "never": 1}
+    else:
+        assert (report.given_up, report.would_give_up) == ([5], [])
+        assert "slot 5: rebuild given up (title rejected as never)" in text
+        assert await rows_by_reason(env) == {"never": 1}
+
+
+async def test__build__rebuild_rows_that_cannot_be_given_up_fail_their_slot_and_not_the_run(
+    env: Env,
+) -> None:
+    one, two = (
+        await create_title(env.db, name="One", igdb_id=1),
+        await create_title(env.db, name="Two", igdb_id=2),
+    )
+    await add_rebuild_rows(env, 6, one, two, never=one)
+    igdb = FakeIgdb([])
+    # A report that already holds an outcome of slot 7 does not make the run skip slot 7.
+    report = BuildReport(outcomes=[SlotOutcome(7, SlotStatus.EXISTS, "an earlier try")])
+
+    await env.builder(igdb).run(SlotRequest(slots=range(6, 8)), report)
+
+    assert [(o.slot, o.status, o.detail) for o in report.outcomes] == [
+        (7, SlotStatus.EXISTS, "an earlier try"),
+        (6, SlotStatus.FAILED, "bad_rebuild_row"),
+        (7, SlotStatus.FAILED, "no_candidate"),
+    ]
+    assert await rows_by_reason(env) == {"rebuild": 2, "never": 1}  # nothing was changed
+
+
+async def test__build__rebuilds_are_capped_per_run_and_next_stops_at_the_last_slot_number(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(builder_module, "MAX_SLOTS_PER_RUN", 2)
+    title = await create_title(env.db, name="Waiting", igdb_id=3)
+    title_id = title.id
+    for slot in (1, 2, 3):
+        await add_rebuild_rows(env, slot, title)
+
+    report = await env.builder(FakeIgdb([]), dry_run=True).run(SlotRequest(rebuilds=True))
+
+    assert (report.slots, report.left_over) == ([1, 2], 1)
+    assert "1 more slot(s) wait for a rebuild: run again" in "\n".join(report.lines())
+
+    game = await env.db.get(Game, env.game_id)
+    answer = await env.db.get(Title, title_id)
+    assert game is not None and answer is not None
+    last = await create_puzzle(env.db, game=game, answer=answer, puzzle_date=dt.date(2026, 11, 1))
+    last.build_slot = MAX_SLOT_NUMBER
+    await env.db.commit()
+    with pytest.raises(SlotLimitError, match="would go past"):
+        await env.builder(FakeIgdb([]), dry_run=True).run(SlotRequest(next_count=1))
+
+
+async def test__database_session__names_database_errors_and_leaves_storage_errors_alone(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Maker:
+        def __call__(self) -> "Maker":
+            return self
+
+        async def __aenter__(self) -> AsyncSession:
+            return env.db
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+    class FullDisk(LocalMediaWriter):
+        def put(self, key: str, path: Path, content_type: str) -> bool:
+            raise OSError("the disk is full")
+
+    monkeypatch.setattr("app.core.db.async_session_maker", Maker())
+
+    with pytest.raises(DatabaseFailure, match="ConnectionRefusedError"):
+        async with database_session():
+            raise ConnectionRefusedError("down")
+    # A storage error is named before it reaches the session: it is not taken for the database's.
+    with pytest.raises(MediaWriteError):
+        async with database_session() as db:
+            builder = env.builder(FakeIgdb([make_game(1)]), writer=FullDisk(env.storage))
+            assert builder.db is db
+            await builder.run(SlotRequest(slots=range(1, 2)))
 
 
 # Storage writer -----------------------------------------------------------------------------
@@ -923,3 +1144,39 @@ def test__s3_writer__skips_a_key_that_exists_and_puts_a_private_object(
     )
     assert len(stored) == 1
     assert stored[0]["ContentType"] == "video/mp4" and "ACL" not in stored[0]
+
+
+def test__s3_writer__names_every_bucket_error_a_media_write_error(tmp_path: Path) -> None:
+    writer = S3MediaWriter(
+        endpoint_url="https://s3.test",
+        region="eu",
+        bucket="b",
+        access_key_id="a",
+        secret_access_key="s",
+    )
+    source = tmp_path / "f"
+    source.write_bytes(b"x")
+    key = hashlib.sha256(b"x").hexdigest()
+    head_error: Exception = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+    put_error: Exception = ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject")
+
+    class StubClient:
+        def head_object(self, **kwargs: Any) -> None:
+            raise head_error
+
+        def put_object(self, **kwargs: Any) -> None:
+            raise put_error
+
+    writer.client = StubClient()
+
+    with pytest.raises(MediaWriteError, match="refused a PUT: AccessDenied"):
+        writer.put(key, source, "image/webp")
+    put_error = EndpointConnectionError(endpoint_url="https://s3.test")
+    with pytest.raises(MediaWriteError, match="cannot be reached: EndpointConnectionError"):
+        writer.put(key, source, "image/webp")
+    head_error = EndpointConnectionError(endpoint_url="https://s3.test")
+    with pytest.raises(MediaWriteError, match="cannot be reached"):
+        writer.exists(key)
+    head_error = ClientError({"Error": {"Code": "500"}}, "HeadObject")
+    with pytest.raises(MediaWriteError, match="refused a HEAD: 500"):
+        writer.exists(key)

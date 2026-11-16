@@ -52,7 +52,7 @@ from app.content.candidates import (
 )
 from app.content.fetch import FetchError, ResponseTooLargeError, build_client, send_capped
 from app.content.hints import hints, source_url
-from app.content.igdb import IgdbGame
+from app.content.igdb import MAX_RETRIES, IgdbGame, retry_delay
 from app.content.media import MediaFacts, MediaLimitError
 from app.content.seed import Purpose, SlotSeed, check_salt, reserved_secrets
 from app.content.settings import ContentSettings
@@ -71,7 +71,7 @@ from app.crud.puzzle import (
 )
 from app.crud.title import create_title, find_key_holders, get_titles_by_igdb_ids
 from app.games.enums import ClueContentType, ClueRole, ExclusionReason, MediaType
-from app.media.writer import MediaWriter, write_atomically
+from app.media.writer import MediaWriteError, MediaWriter, write_atomically
 from app.models.puzzle import PuzzleStatus
 from app.models.title import TitleKind
 
@@ -85,6 +85,8 @@ IMAGE_ID = re.compile(r"[a-z0-9]+", re.ASCII)
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 # A typo like `--slots 1-99999999` must not start a run that never ends.
 MAX_SLOTS_PER_RUN = 500
+# Slot numbers have at most six digits, in `--slots`, `--give-up` and what `--next` may reach.
+MAX_SLOT_NUMBER = 999_999
 STEPS = 6
 
 FetchImage = Callable[[str], Awaitable[bytes]]
@@ -107,34 +109,70 @@ class GiveUpError(Exception):
     """A slot's rebuild rows cannot be given up (they name more than one title)."""
 
 
+class SlotLimitError(Exception):
+    """The slots a run would build go past `MAX_SLOT_NUMBER`."""
+
+
 class DatabaseFailure(Exception):
     """A database call failed. The message is the error's type only: no statement, no value."""
 
 
 @contextlib.contextmanager
 def database_errors() -> Iterator[None]:
-    """Name a failure of the database calls inside the block `DatabaseFailure`. An unreachable
-    Postgres raises `ConnectionRefusedError`, an `OSError` like a file error, so the calls to the
-    database are wrapped where they are made and the script can tell the two apart. Keep file and
-    storage calls out of the block."""
+    """Name an `SQLAlchemyError` or `OSError` raised inside the block `DatabaseFailure`. An
+    unreachable Postgres raises `ConnectionRefusedError`, an `OSError` like a file error, so what
+    is database work has to be named in one place. Storage and file work inside the block must be
+    classified before it gets here (`MediaWriteError`, a slot error), or it would be named wrongly."""
     try:
         yield
     except (SQLAlchemyError, OSError) as error:
         raise DatabaseFailure(type(error).__name__) from error
 
 
+@contextlib.asynccontextmanager
+async def database_session() -> AsyncIterator[AsyncSession]:
+    """The session of a script run, for its whole lifetime: opening it, every call made with it
+    and closing it (with the engine) are classified by `database_errors`, so a down database is a
+    `DatabaseFailure` whichever call finds out. The builder classifies its storage and file errors
+    before they reach this."""
+    from app.core import db as core_db  # Looked up at call time, so a test can replace the maker.
+
+    try:
+        with database_errors():
+            async with core_db.async_session_maker() as session:
+                yield session
+    finally:
+        with contextlib.suppress(Exception):
+            await core_db.engine.dispose()
+
+
 class ImageUnavailableError(FetchError):
-    """IGDB's image host does not have this one screenshot (a status other than 200). It fails the
-    slot, not the run; a refused host, which is a `ForbiddenHostError`, stops the run."""
+    """IGDB's image host does not have this one screenshot (404 or 410). It fails the slot, not
+    the run; a refused host, which is a `ForbiddenHostError`, stops the run."""
+
+
+class ImageHostUnavailableError(FetchError):
+    """The image host keeps answering 429 or 5xx, or something unexpected: it stops the run, as a
+    network error does, so the run does not hammer a host that is down."""
+
+
+# Only these mean "this screenshot is missing".
+MISSING_IMAGE_STATUSES = frozenset({404, 410})
 
 
 class ImageFetcher:
     """Fetches IGDB screenshots through the allow-listed client (AC-85): `images.igdb.com` only,
-    https only, no redirect, a size cap. The bytes are untrusted; `media` decodes and re-encodes
-    them."""
+    https only, no redirect, a size cap. A 429 or 5xx is retried like the IGDB client does (at most
+    `MAX_RETRIES` times, `Retry-After` honoured). The bytes are untrusted; `media` decodes and
+    re-encodes them."""
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         self._http = build_client(transport)
+        self._sleep = sleep
 
     async def __aenter__(self) -> Self:
         return self
@@ -145,11 +183,23 @@ class ImageFetcher:
     async def fetch(self, image_id: str) -> bytes:
         if IMAGE_ID.fullmatch(image_id) is None:
             raise FetchError("an IGDB image id has only lowercase letters and digits")
-        request = self._http.build_request("GET", IMAGE_URL.format(image_id=image_id))
-        response = await send_capped(self._http, request, max_bytes=MAX_IMAGE_BYTES)
-        if response.status_code != 200:
-            raise ImageUnavailableError(f"IGDB's image host answered {response.status_code}")
-        return response.content
+        retries = 0
+        while True:
+            request = self._http.build_request("GET", IMAGE_URL.format(image_id=image_id))
+            response = await send_capped(self._http, request, max_bytes=MAX_IMAGE_BYTES)
+            status = response.status_code
+            if status == 200:
+                return response.content
+            if status in MISSING_IMAGE_STATUSES:
+                raise ImageUnavailableError(f"IGDB's image host does not have it ({status})")
+            if status != 429 and status < 500:
+                raise ImageHostUnavailableError(f"IGDB's image host answered {status}")
+            if retries >= MAX_RETRIES:
+                raise ImageHostUnavailableError(
+                    f"IGDB's image host is unavailable: {status}, after {retries} retries"
+                )
+            await self._sleep(retry_delay(retries, response.headers.get("retry-after")))
+            retries += 1
 
 
 class SlotStatus(StrEnum):
@@ -176,8 +226,6 @@ class SlotOutcome:
     files: list[FilePlan] = field(default_factory=list)
     hint_steps: list[int] = field(default_factory=list)
     near_duplicates: int = 0
-    # The slot's rebuild title was rejected as "never": the rebuild is given up and the slot is free.
-    given_up: bool = False
 
 
 @dataclass
@@ -186,6 +234,16 @@ class BuildReport:
 
     slots: list[int] = field(default_factory=list)
     outcomes: list[SlotOutcome] = field(default_factory=list)
+    # Slots whose rebuild title was rejected as "never": the rebuild rows are given up (written), or
+    # in a dry run would be. Recorded the moment it happens, whatever the slot does afterwards.
+    given_up: list[int] = field(default_factory=list)
+    would_give_up: list[int] = field(default_factory=list)
+    # `--rebuilds` builds at most `MAX_SLOTS_PER_RUN` slots a run; the rest wait for the next run.
+    left_over: int = 0
+
+    @property
+    def has_content(self) -> bool:
+        return bool(self.slots or self.outcomes or self.given_up or self.would_give_up)
 
     @property
     def is_ok(self) -> bool:
@@ -196,6 +254,16 @@ class BuildReport:
         then as JSON text, so a control character in IGDB's data cannot reach the terminal. Never a
         media key, a path or a screenshot id."""
         lines = [f"slots: {_range_text(self.slots)}"]
+        if self.left_over:
+            lines.append(f"{self.left_over} more slot(s) wait for a rebuild: run again")
+        lines += [
+            f"slot {slot}: rebuild given up (title rejected as never)"
+            for slot in sorted(self.given_up)
+        ]
+        lines += [
+            f"slot {slot}: rebuild would be given up (title rejected as never)"
+            for slot in sorted(self.would_give_up)
+        ]
         for outcome in sorted(self.outcomes, key=lambda outcome: outcome.slot):
             head = f"slot {outcome.slot}: {outcome.status}"
             if outcome.is_rebuild:
@@ -203,12 +271,6 @@ class BuildReport:
             if outcome.detail:
                 head += f": {outcome.detail}"
             lines.append(head)
-            if outcome.given_up:
-                lines.append(
-                    "  rebuild would be given up (title rejected as never)"
-                    if outcome.status == SlotStatus.PLANNED
-                    else "  rebuild given up (title rejected as never)"
-                )
             if outcome.status in (SlotStatus.BUILT, SlotStatus.PLANNED):
                 lines.append(f"  hints at steps: {', '.join(map(str, outcome.hint_steps)) or '-'}")
                 for plan in outcome.files:
@@ -249,16 +311,25 @@ class SlotRequest:
         if (self.slots is not None) + (self.next_count is not None) + self.rebuilds != 1:
             raise ValueError("ask for exactly one of a slot range, a next count and the rebuilds")
         count = len(self.slots) if self.slots is not None else self.next_count or 0
-        if self.slots is not None and (self.slots.start < 1 or count < 1):
-            raise ValueError("slots start at 1 and a range has at least one")
+        if self.slots is not None and (
+            self.slots.start < 1 or count < 1 or self.slots.stop - 1 > MAX_SLOT_NUMBER
+        ):
+            raise ValueError(f"slots go from 1 to {MAX_SLOT_NUMBER} and a range has at least one")
         if not 0 <= count <= MAX_SLOTS_PER_RUN:
             raise ValueError(f"a run builds at most {MAX_SLOTS_PER_RUN} slots")
 
     def pick(self, *, puzzle_slots: set[int], rebuild_slots: set[int]) -> list[int]:
+        """The slots of the run. `--rebuilds` takes the first `MAX_SLOTS_PER_RUN` waiting slots;
+        `SlotLimitError` when `--next` would go past `MAX_SLOT_NUMBER`."""
         if self.rebuilds:
-            return sorted(rebuild_slots - puzzle_slots)
+            return sorted(rebuild_slots - puzzle_slots)[:MAX_SLOTS_PER_RUN]
         if self.next_count is not None:
             highest = max(puzzle_slots | rebuild_slots, default=0)
+            if highest + self.next_count > MAX_SLOT_NUMBER:
+                raise SlotLimitError(
+                    f"{self.next_count} more slots after slot {highest} would go past"
+                    f" slot {MAX_SLOT_NUMBER}"
+                )
             return list(range(highest + 1, highest + 1 + self.next_count))
         assert self.slots is not None
         return list(self.slots)
@@ -402,7 +473,8 @@ class Builder:
     already run the target guard (`check_target`).
 
     No database transaction stays open across the IGDB read, the fetches or the encodes: the reads
-    are ended with a rollback (nothing is pending then) before those start."""
+    are ended with a rollback (nothing is pending then) before those start. Database errors are
+    not classified here but around the session of the run (`database_session`)."""
 
     def __init__(
         self,
@@ -435,8 +507,6 @@ class Builder:
         self.variant = ""
         self.exclusions: list[ExclusionRow] = []
         self.earlier: set[int] = set()
-        # Slots whose rebuild title was rejected as "never" and whose rebuild rows are given up.
-        self.given_up: set[int] = set()
         # Candidates the slot being built left out as near-duplicates of a stored title (R-20).
         self.near_duplicates = 0
         self.salt = settings.PUZZLE_SEED_SALT
@@ -451,15 +521,14 @@ class Builder:
             self.settings.PUZZLE_SEED_SALT,
             reserved_secrets(self.app_settings, self.settings.IGDB_CLIENT_SECRET),
         )
-        with database_errors():
-            game = await get_game_by_slug(self.db, self.game_slug)
-            if game is None:
-                raise UnknownGameError(f"no game with the slug {self.game_slug!r} in the database")
-            self.game_id, self.variant = game.id, game.default_variant
-            puzzle_slots = await list_puzzle_slots(self.db, self.game_id, self.variant)
-            self.exclusions = await list_exclusions(self.db, self.game_id)
-            self.earlier = await list_answer_igdb_ids(self.db, self.game_id)
-            await self.db.rollback()
+        game = await get_game_by_slug(self.db, self.game_slug)
+        if game is None:
+            raise UnknownGameError(f"no game with the slug {self.game_slug!r} in the database")
+        self.game_id, self.variant = game.id, game.default_variant
+        puzzle_slots = await list_puzzle_slots(self.db, self.game_id, self.variant)
+        self.exclusions = await list_exclusions(self.db, self.game_id)
+        self.earlier = await list_answer_igdb_ids(self.db, self.game_id)
+        await self.db.rollback()  # No transaction stays open through the IGDB read.
         rebuild_slots = {
             row.build_slot
             for row in self.exclusions
@@ -469,6 +538,8 @@ class Builder:
         }
         slots = request.pick(puzzle_slots=puzzle_slots, rebuild_slots=rebuild_slots)
         report.slots = slots
+        if request.rebuilds:
+            report.left_over = len(rebuild_slots - puzzle_slots) - len(slots)
         # A slot that has a puzzle is never touched, whatever its status or games (AC-46, AC-86).
         # When every slot has one, IGDB is not even read.
         todo = [slot for slot in slots if slot not in puzzle_slots]
@@ -477,21 +548,25 @@ class Builder:
                 report.outcomes.append(
                     SlotOutcome(slot, SlotStatus.EXISTS, "the slot already has a puzzle")
                 )
-        await self._give_up_rejected(todo, report)
-        todo = [slot for slot in todo if all(o.slot != slot for o in report.outcomes)]
+        failed = await self._give_up_rejected(todo, report)
+        todo = [slot for slot in todo if slot not in failed]
         pool = await self._read_pool() if todo else []
         for slot in todo:
             report.outcomes.append(await self._build_slot(slot, pool))
         return report
 
-    async def _give_up_rejected(self, slots: list[int], report: BuildReport) -> None:
+    async def _give_up_rejected(self, slots: list[int], report: BuildReport) -> set[int]:
         """A rebuilt draft that the reviewer then rejected as "never" leaves its slot with rebuild
         rows for a title that can no longer be an answer. Such a slot is given up here, as
-        `--give-up` does, and is free for a new answer. A dry run only reports it and plans the slot
-        as free."""
+        `--give-up` does, and is free for a new answer. Each one is recorded in the report the
+        moment it is committed (`given_up`), so a run that stops later still shows it. A dry run
+        only reports it (`would_give_up`) and plans the slot as free. Returns the slots whose rows
+        cannot be given up (they name more than one title): they have a FAILED outcome in the
+        report and are not built."""
         never_titles = {
             row.title_id for row in self.exclusions if row.reason == ExclusionReason.NEVER
         }
+        failed: set[int] = set()
         for slot in slots:
             rows = [
                 row
@@ -501,21 +576,24 @@ class Builder:
             ]
             if not any(row.title_id in never_titles for row in rows):
                 continue
-            if not self.dry_run:
+            if self.dry_run:
+                report.would_give_up.append(slot)
+            else:
                 try:
-                    with database_errors():
-                        await give_up_rebuild(
-                            self.db, game_id=self.game_id, variant=self.variant, slot=slot
-                        )
-                        await self.db.commit()
+                    await give_up_rebuild(
+                        self.db, game_id=self.game_id, variant=self.variant, slot=slot
+                    )
+                    await self.db.commit()
                 except ValueError:
                     with contextlib.suppress(Exception):
                         await self.db.rollback()
                     report.outcomes.append(SlotOutcome(slot, SlotStatus.FAILED, "bad_rebuild_row"))
+                    failed.add(slot)
                     continue
-            self.given_up.add(slot)
+                report.given_up.append(slot)
             gone = {id(row) for row in rows}
             self.exclusions = [row for row in self.exclusions if id(row) not in gone]
+        return failed
 
     async def _read_pool(self) -> list[IgdbGame]:
         """The games that pass the filters that do not depend on the slot. Read once for the run;
@@ -546,8 +624,7 @@ class Builder:
         try:
             plan = await self._plan(slot, pool)
             # The planning reads are over: no transaction stays open through the fetches and encodes.
-            with database_errors():
-                await self.db.rollback()
+            await self.db.rollback()
             files = await self._make_files(plan)
             # The media rule is checked for a dry run too, before anything is written (AC-13b).
             clues = clue_inputs(plan, files)
@@ -569,20 +646,13 @@ class Builder:
             files=[FilePlan(file.step, file.role, file.facts) for file in files],
             hint_steps=[step for step, hint in hints(plan.game).items() if hint is not None],
             near_duplicates=self.near_duplicates,
-            given_up=slot in self.given_up,
         )
         if not self.dry_run:
             await self._write(plan, files, clues)
         return outcome
 
     def _failed(self, slot: int, detail: str) -> SlotOutcome:
-        return SlotOutcome(
-            slot,
-            SlotStatus.FAILED,
-            detail,
-            near_duplicates=self.near_duplicates,
-            given_up=slot in self.given_up,
-        )
+        return SlotOutcome(slot, SlotStatus.FAILED, detail, near_duplicates=self.near_duplicates)
 
     async def _plan(self, slot: int, pool: list[IgdbGame]) -> SlotPlan:
         seed = self._seed(slot)
@@ -640,16 +710,14 @@ class Builder:
         stream = seed.stream(Purpose.ANSWER)
         while True:
             game = choose_answer(remaining, stream)
-            with database_errors():
-                stored = (await get_titles_by_igdb_ids(self.db, [game.id])).get(game.id)
+            stored = (await get_titles_by_igdb_ids(self.db, [game.id])).get(game.id)
             if stored is not None:
                 return game, stored.id, None
             record = to_record(game)
             if isinstance(record, ImportRecord):
-                with database_errors():
-                    holders = await find_key_holders(
-                        self.db, kind=TitleKind.VIDEO_GAME, keys=[record.key]
-                    )
+                holders = await find_key_holders(
+                    self.db, kind=TitleKind.VIDEO_GAME, keys=[record.key]
+                )
                 if not holders:
                     return game, None, record
             remaining = [candidate for candidate in remaining if candidate.id != game.id]
@@ -668,41 +736,48 @@ class Builder:
         out_dir = self.settings.content_work_path / "out" / str(plan.slot)
         return await asyncio.to_thread(make_files, plan.shots, raw, self._seed(plan.slot), out_dir)
 
+    async def _put(self, file: BuiltFile) -> None:
+        """Store one file. A storage `OSError` is named a `MediaWriteError` here, before it can be
+        taken for a database error by the session's wrapper."""
+        assert self.writer is not None
+        try:
+            await asyncio.to_thread(self.writer.put, file.key, file.path, file.facts.content_type)
+        except OSError as error:
+            raise MediaWriteError(f"a file cannot be stored: {type(error).__name__}") from error
+
     async def _write(self, plan: SlotPlan, files: list[BuiltFile], clues: list[ClueInput]) -> None:
         """Files first, then the rows in one transaction (AC-46). A failure rolls the rows back and
         stops the run; the files stay."""
-        assert self.writer is not None
         for file in files:
-            await asyncio.to_thread(self.writer.put, file.key, file.path, file.facts.content_type)
-        with database_errors():
-            try:
-                title_id = plan.title_id
-                if title_id is None:
-                    assert plan.record is not None
-                    title = await create_title(
-                        self.db,
-                        name=plan.record.name,
-                        franchise=plan.record.franchise,
-                        year=plan.record.year,
-                        igdb_id=plan.record.igdb_id,
-                    )
-                    title_id = title.id
-                await add_built_puzzle(
+            await self._put(file)
+        try:
+            title_id = plan.title_id
+            if title_id is None:
+                assert plan.record is not None
+                title = await create_title(
                     self.db,
-                    game_id=self.game_id,
-                    variant=self.variant,
-                    build_slot=plan.slot,
-                    generator_version=GENERATOR_VERSION,
-                    answer_title_id=title_id,
-                    status=PuzzleStatus.IN_REVIEW,
-                    clues=clues,
+                    name=plan.record.name,
+                    franchise=plan.record.franchise,
+                    year=plan.record.year,
+                    igdb_id=plan.record.igdb_id,
                 )
-                await self.db.commit()
-            except BaseException:
-                # A failing rollback (the database is gone) never replaces the original error.
-                with contextlib.suppress(Exception):
-                    await self.db.rollback()
-                raise
+                title_id = title.id
+            await add_built_puzzle(
+                self.db,
+                game_id=self.game_id,
+                variant=self.variant,
+                build_slot=plan.slot,
+                generator_version=GENERATOR_VERSION,
+                answer_title_id=title_id,
+                status=PuzzleStatus.IN_REVIEW,
+                clues=clues,
+            )
+            await self.db.commit()
+        except BaseException:
+            # A failing rollback (the database is gone) never replaces the original error.
+            with contextlib.suppress(Exception):
+                await self.db.rollback()
+            raise
 
 
 async def give_up_slot(db: AsyncSession, game_slug: str, slot: int) -> int:
@@ -710,22 +785,20 @@ async def give_up_slot(db: AsyncSession, game_slug: str, slot: int) -> int:
     their title, which frees the slot for a new answer. Returns the number of rebuild rows it
     replaced, 0 when there was nothing to give up. A slot that has a puzzle is left alone (AC-86).
     `GiveUpError` when the slot's rows name more than one title."""
-    with database_errors():
-        game = await get_game_by_slug(db, game_slug)
-        if game is None:
-            raise UnknownGameError(f"no game with the slug {game_slug!r} in the database")
-        if slot in await list_puzzle_slots(db, game.id, game.default_variant):
-            return 0
-        try:
-            count = await give_up_rebuild(
-                db, game_id=game.id, variant=game.default_variant, slot=slot
-            )
-            await db.commit()
-        except ValueError as error:
+    game = await get_game_by_slug(db, game_slug)
+    if game is None:
+        raise UnknownGameError(f"no game with the slug {game_slug!r} in the database")
+    if slot in await list_puzzle_slots(db, game.id, game.default_variant):
+        return 0
+    try:
+        count = await give_up_rebuild(db, game_id=game.id, variant=game.default_variant, slot=slot)
+        await db.commit()
+    except ValueError as error:
+        with contextlib.suppress(Exception):
             await db.rollback()
-            raise GiveUpError(str(error)) from error
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            raise
-        return count
+        raise GiveUpError(str(error)) from error
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        raise
+    return count

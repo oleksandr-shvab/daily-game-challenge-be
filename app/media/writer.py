@@ -92,10 +92,13 @@ class S3MediaWriter:
         secret_access_key: str,
     ) -> None:
         self.bucket = bucket
-        # Imported here, so a run with local storage never loads boto3.
+        # Imported here, once, so a run with local storage never loads boto3 or botocore.
         import boto3.session
         from botocore.config import Config
+        from botocore.exceptions import BotoCoreError, ClientError
 
+        self._client_error = ClientError
+        self._boto_error = BotoCoreError
         self.client: Any = boto3.session.Session().client(
             "s3",
             endpoint_url=endpoint_url,
@@ -105,27 +108,29 @@ class S3MediaWriter:
             config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         )
 
+    def _write_error(self, error: Exception, action: str) -> MediaWriteError:
+        """The one place a botocore error becomes a `MediaWriteError`: no message of the library,
+        which can hold the endpoint, only the error code or the class."""
+        if isinstance(error, self._client_error):
+            code = error.response.get("Error", {}).get("Code", "unknown")
+            return MediaWriteError(f"the bucket refused a {action}: {code}")
+        return MediaWriteError(f"the bucket cannot be reached: {type(error).__name__}")
+
     def exists(self, key: str) -> bool:
         """True when the bucket says the key is there. A 403 on a HEAD is "not known to exist": the
         store may hide a missing key from credentials without ListBucket. `put` is content-addressed,
         so writing the same bytes again is harmless."""
-        from botocore.exceptions import BotoCoreError, ClientError
-
         try:
             self.client.head_object(Bucket=self.bucket, Key=_checked_key(key))
-        except ClientError as error:
+        except self._client_error as error:
             if error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_CODES:
                 return False
-            raise MediaWriteError(f"the bucket refused a HEAD: {_code(error)}") from error
-        except BotoCoreError as error:
-            raise MediaWriteError(
-                f"the bucket cannot be reached: {type(error).__name__}"
-            ) from error
+            raise self._write_error(error, "HEAD") from error
+        except self._boto_error as error:
+            raise self._write_error(error, "HEAD") from error
         return True
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
-        from botocore.exceptions import BotoCoreError, ClientError
-
         if self.exists(key):
             return False
         try:
@@ -134,17 +139,9 @@ class S3MediaWriter:
                 self.client.put_object(
                     Bucket=self.bucket, Key=key, Body=body, ContentType=content_type
                 )
-        except ClientError as error:
-            raise MediaWriteError(f"the bucket refused a PUT: {_code(error)}") from error
-        except BotoCoreError as error:
-            raise MediaWriteError(
-                f"the bucket cannot be reached: {type(error).__name__}"
-            ) from error
+        except (self._client_error, self._boto_error) as error:
+            raise self._write_error(error, "PUT") from error
         return True
-
-
-def _code(error: Any) -> str:
-    return str(error.response.get("Error", {}).get("Code", "unknown"))
 
 
 def build_media_writer(app_settings: Settings) -> MediaWriter:

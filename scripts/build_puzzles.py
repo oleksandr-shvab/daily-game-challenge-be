@@ -46,21 +46,22 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy.exc import SQLAlchemyError
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.content.builder import (
+    MAX_SLOT_NUMBER,
     MAX_SLOTS_PER_RUN,
     Builder,
     BuildReport,
     DatabaseFailure,
     GiveUpError,
     ImageFetcher,
+    SlotLimitError,
     SlotRequest,
     UnknownGameError,
-    database_errors,
+    database_session,
     give_up_slot,
 )
 from app.content.candidates import (
@@ -110,35 +111,31 @@ def _breakdown(counter: Counter[Any]) -> str:
 
 
 async def run_counts(settings: ContentSettings, slug: str) -> CountsReport:
-    from app.core.db import async_session_maker, engine
     from app.crud.exclusion import list_exclusions
     from app.crud.game import get_game_by_slug
     from app.crud.puzzle import list_answer_igdb_ids
 
-    try:
-        now = get_now()
-        async with async_session_maker() as db:
-            with database_errors():
-                game = await get_game_by_slug(db, slug)
-                if game is None:
-                    raise UnknownGameError(f"no game with the slug {slug!r} in the database")
-                earlier = await list_answer_igdb_ids(db, game.id)
-                exclusions = await list_exclusions(db, game.id)
-        counter = FunnelCounter(
-            today=utc_today(now),
-            settings=settings,
-            earlier_answer_igdb_ids=earlier,
-            never_igdb_ids=never_igdb_ids(exclusions),
-            reserved_igdb_ids=rebuild_reserved_igdb_ids(exclusions),
-            keep_candidates=False,
-        )
-        async with IgdbClient.from_settings(settings) as igdb:
-            # One game at a time: only the games that pass are kept.
-            async for igdb_game in igdb.games(now=now, where=candidates_where(settings)):
-                counter.add(igdb_game)
-            return CountsReport(counter.result(), igdb.skipped, igdb.dropped)
-    finally:
-        await engine.dispose()
+    now = get_now()
+    # The whole session, its opening and closing included, is database work (`DatabaseFailure`).
+    async with database_session() as db:
+        game = await get_game_by_slug(db, slug)
+        if game is None:
+            raise UnknownGameError(f"no game with the slug {slug!r} in the database")
+        earlier = await list_answer_igdb_ids(db, game.id)
+        exclusions = await list_exclusions(db, game.id)
+    counter = FunnelCounter(
+        today=utc_today(now),
+        settings=settings,
+        earlier_answer_igdb_ids=earlier,
+        never_igdb_ids=never_igdb_ids(exclusions),
+        reserved_igdb_ids=rebuild_reserved_igdb_ids(exclusions),
+        keep_candidates=False,
+    )
+    async with IgdbClient.from_settings(settings) as igdb:
+        # One game at a time: only the games that pass are kept.
+        async for igdb_game in igdb.games(now=now, where=candidates_where(settings)):
+            counter.add(igdb_game)
+        return CountsReport(counter.result(), igdb.skipped, igdb.dropped)
 
 
 SLOT_RANGE = re.compile(r"(\d{1,6})(?:-(\d{1,6}))?", re.ASCII)
@@ -169,8 +166,8 @@ def bounded_int(low: int, high: int) -> Callable[[str], int]:
     return parse
 
 
-# Slot numbers are six digits at most, as in `--slots`.
-slot_number = bounded_int(1, 999_999)
+# `--slots` takes the same: six digits at most.
+slot_number = bounded_int(1, MAX_SLOT_NUMBER)
 slot_count = bounded_int(1, MAX_SLOTS_PER_RUN)
 
 
@@ -182,41 +179,32 @@ async def run_build(
 ) -> None:
     """Fills `report` slot by slot, so a run that stops half way still shows what it finished."""
     from app.core.config import settings as app_settings
-    from app.core.db import async_session_maker, engine
 
-    try:
-        now = get_now()
-        writer = None if args.dry_run else build_media_writer(app_settings)
-        async with (
-            IgdbClient.from_settings(settings) as igdb,
-            ImageFetcher() as images,
-            async_session_maker() as db,
-        ):
-            builder = Builder(
-                db,
-                game_slug=args.slug,
-                target=args.target,
-                settings=settings,
-                app_settings=app_settings,
-                now=now,
-                games=lambda: igdb.games(now=now, where=candidates_where(settings)),
-                fetch_image=images.fetch,
-                writer=writer,
-                dry_run=args.dry_run,
-            )
-            await builder.run(request, report)
-    finally:
-        await engine.dispose()
+    now = get_now()
+    writer = None if args.dry_run else build_media_writer(app_settings)
+    async with (
+        IgdbClient.from_settings(settings) as igdb,
+        ImageFetcher() as images,
+        database_session() as db,
+    ):
+        builder = Builder(
+            db,
+            game_slug=args.slug,
+            target=args.target,
+            settings=settings,
+            app_settings=app_settings,
+            now=now,
+            games=lambda: igdb.games(now=now, where=candidates_where(settings)),
+            fetch_image=images.fetch,
+            writer=writer,
+            dry_run=args.dry_run,
+        )
+        await builder.run(request, report)
 
 
 async def run_give_up(slug: str, slot: int) -> int:
-    from app.core.db import async_session_maker, engine
-
-    try:
-        async with async_session_maker() as db:
-            return await give_up_slot(db, slug, slot)
-    finally:
-        await engine.dispose()
+    async with database_session() as db:
+        return await give_up_slot(db, slug, slot)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -259,14 +247,9 @@ def main() -> int:
     logging.basicConfig(level=logging.WARNING)
     settings = ContentSettings()
     report = BuildReport()
-
-    def stop(message: str) -> int:
-        """The run ends early: show the slots it already finished, then why it stopped."""
-        if report.outcomes:
-            print("\n".join(report.lines(show_answers=args.show_answers)))
-        print(f"build_puzzles: {message}", file=sys.stderr)
-        return 1
-
+    # The message of a run that stops early, printed after the report of what it finished.
+    error_message: str | None = None
+    is_started = False
     try:
         if args.counts:
             settings.require("IGDB_CLIENT_ID", "IGDB_CLIENT_SECRET")
@@ -291,11 +274,12 @@ def main() -> int:
                 else f"slot {args.give_up}: no rebuild rows to give up; nothing changed"
             )
             return 0
-        from app.core.config import settings as app_settings
-
-        check_image_gate(args.target, settings.IGDB_IMAGES_CLEARED_BY, app_settings.MEDIA_STORAGE)
+        # `check_target` has already refused a bucket for the target `local`; the builder checks
+        # the writer's storage kind as well.
+        check_image_gate(args.target, settings.IGDB_IMAGES_CLEARED_BY)
         settings.require("IGDB_CLIENT_ID", "IGDB_CLIENT_SECRET")
         request = SlotRequest(slots=args.slots, next_count=args.next, rebuilds=args.rebuilds)
+        is_started = True
         asyncio.run(run_build(settings, args, request, report))
     except (
         TargetRefusedError,
@@ -303,21 +287,29 @@ def main() -> int:
         SaltError,
         UnknownGameError,
         GiveUpError,
+        SlotLimitError,
     ) as error:
-        return stop(f"refusing to run: {error}")
+        error_message = f"refusing to run: {error}"
     except (IgdbError, FetchError, httpx.HTTPError) as error:
-        return stop(str(error))
-    except (DatabaseFailure, SQLAlchemyError) as error:
+        error_message = str(error)
+    except DatabaseFailure as error:
         # The draft being written was rolled back; drafts of earlier slots stay.
-        return stop(
-            f"database error: {error if isinstance(error, DatabaseFailure) else type(error).__name__}"
-        )
+        error_message = f"database error: {error}"
     except (MediaWriteError, OSError) as error:
-        # Database errors were named above, where the database calls are made.
-        return stop(f"storage or file error: {type(error).__name__}")
-    if args.dry_run:
-        print("Dry run: nothing was written to the database or storage.")
-    print("\n".join(report.lines(show_answers=args.show_answers)))
+        # Database errors were named by `database_session`.
+        detail = str(error) if isinstance(error, MediaWriteError) else type(error).__name__
+        error_message = f"storage or file error: {detail}"
+    finally:
+        # One place for every way out of a build run, Ctrl-C and a bug included: what the run
+        # finished is shown first.
+        if is_started:
+            if args.dry_run:
+                print("Dry run: nothing was written to the database or storage.")
+            if report.has_content:
+                print("\n".join(report.lines(show_answers=args.show_answers)))
+    if error_message is not None:
+        print(f"build_puzzles: {error_message}", file=sys.stderr)
+        return 1
     return 0 if report.is_ok else 1
 
 
