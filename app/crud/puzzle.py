@@ -1,6 +1,7 @@
 import datetime as dt
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from sqlalchemy import ColumnElement, and_, exists, func, select, tuple_
@@ -9,7 +10,7 @@ from sqlalchemy.orm import joinedload
 
 from app.models.game import Game
 from app.models.progress import Progress, ProgressGuess
-from app.models.puzzle import Puzzle, PuzzleClue, PuzzleStatus
+from app.models.puzzle import ClueMediaFile, Puzzle, PuzzleClue, PuzzleStatus
 from app.models.title import Title
 
 
@@ -133,3 +134,92 @@ async def list_answer_igdb_ids(db: AsyncSession, game_id: int) -> set[int]:
         .distinct()
     )
     return set(result.scalars())
+
+
+async def list_puzzle_slots(db: AsyncSession, game_id: int, variant: str) -> set[int]:
+    """The build slots that have a puzzle, in any status."""
+    result = await db.execute(
+        select(Puzzle.build_slot).where(
+            Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.build_slot.is_not(None)
+        )
+    )
+    return set(result.scalars())
+
+
+@dataclass(frozen=True)
+class MediaFileInput:
+    role: str
+    key: str
+    content_type: str
+    byte_size: int
+    width: int
+    height: int
+    duration_ms: int | None
+
+
+@dataclass(frozen=True)
+class ClueInput:
+    step: int
+    media_type: str
+    hint_kind: str | None
+    hint_value: str | None
+    source_url: str
+    source_image_ids: list[str]
+    files: Sequence[MediaFileInput]
+
+
+async def add_clue_media_file(db: AsyncSession, clue_id: int, file: MediaFileInput) -> None:
+    db.add(
+        ClueMediaFile(
+            clue_id=clue_id,
+            role=file.role,
+            key=file.key,
+            content_type=file.content_type,
+            byte_size=file.byte_size,
+            width=file.width,
+            height=file.height,
+            duration_ms=file.duration_ms,
+        )
+    )
+    await db.flush()
+
+
+async def add_built_puzzle(
+    db: AsyncSession,
+    *,
+    game_id: int,
+    variant: str,
+    build_slot: int,
+    generator_version: str,
+    answer_title_id: int,
+    status: PuzzleStatus,
+    clues: Sequence[ClueInput],
+) -> Puzzle:
+    """The builder's insert: a puzzle with no date, its clues and their media rows. It flushes and
+    never commits; the caller owns the transaction, so a draft exists whole or not at all."""
+    puzzle = Puzzle(
+        game_id=game_id,
+        variant=variant,
+        date=None,
+        status=status,
+        build_slot=build_slot,
+        generator_version=generator_version,
+        answer_title_id=answer_title_id,
+    )
+    db.add(puzzle)
+    await db.flush()
+    for clue_input in clues:
+        clue = PuzzleClue(
+            puzzle_id=puzzle.id,
+            step=clue_input.step,
+            media_type=clue_input.media_type,
+            hint_kind=clue_input.hint_kind,
+            hint_value=clue_input.hint_value,
+            source_url=clue_input.source_url,
+            source_image_ids=clue_input.source_image_ids,
+        )
+        db.add(clue)
+        await db.flush()
+        for file in clue_input.files:
+            await add_clue_media_file(db, clue.id, file)
+    return puzzle
