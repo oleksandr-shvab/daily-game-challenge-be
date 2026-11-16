@@ -46,10 +46,10 @@ from app.content.builder import (
     database_session,
     give_up_slot,
 )
-from app.content.candidates import never_igdb_ids
+from app.content.candidates import assign_screenshots, choose_answer, never_igdb_ids
 from app.content.fetch import ForbiddenHostError, ResponseTooLargeError
 from app.content.igdb import MAX_RETRIES, IgdbError, IgdbGame, parse_game
-from app.content.seed import TEST_SALT, SaltError
+from app.content.seed import TEST_SALT, Purpose, SaltError, SlotSeed
 from app.content.settings import ContentSettings
 from app.content.target import TargetRefusedError
 from app.core.config import settings as app_settings
@@ -1075,6 +1075,273 @@ async def test__database_session__names_database_errors_and_leaves_storage_error
             builder = env.builder(FakeIgdb([make_game(1)]), writer=FullDisk(env.storage))
             assert builder.db is db
             await builder.run(SlotRequest(slots=range(1, 2)))
+
+
+# (e) What a run keeps and prints ------------------------------------------------------------
+
+
+async def test__build__stores_the_seeds_choices_with_every_screenshot_at_its_own_step(
+    env: Env, tmp_path: Path
+) -> None:
+    games = [make_game(number, screenshots=21) for number in range(1, 5)]
+    # The seed is the slug, the variant, the slot and the generator version: nothing else decides.
+    seed = SlotSeed(
+        SecretStr(TEST_SALT), "game-guesser", "default", 1, GENERATOR_VERSION, other_secrets=()
+    )
+    answer = choose_answer(games, seed.stream(Purpose.ANSWER))
+    plan = assign_screenshots(
+        answer, seed.stream(Purpose.SCREENSHOTS), set(), settings=env.settings
+    )
+    assert len(plan.clip) == 3  # a clip of three, so its order can show
+
+    await env.builder(FakeIgdb(games)).run(SlotRequest(slots=range(1, 2)))
+
+    puzzle = await puzzle_in_slot(env.db, 1)
+    title = await env.db.get(Title, puzzle.answer_title_id)
+    assert title is not None and title.igdb_id == answer.id
+    clues = await clues_of(env.db, puzzle)
+    assert [clue.source_image_ids for clue in clues] == [
+        [plan.crop.image_id],
+        *([shot.image_id] for shot in plan.steps),
+        [shot.image_id for shot in plan.clip],
+    ]
+    # Each file is made from the screenshot its clue names: make them again from the raw cache.
+    raw = env.settings.content_work_path / "raw"
+    again = [tmp_path / f"step{step}.webp" for step in range(1, 6)]
+    media.pixelated_crop(raw / plan.crop.image_id, again[0], seed.stream(Purpose.CROP))
+    for path, shot in zip(again[1:], plan.steps, strict=True):
+        media.still(raw / shot.image_id, path)
+    assert [(await files_of(env.db, clue))[0].key for clue in clues[:5]] == [
+        hashlib.sha256(path.read_bytes()).hexdigest() for path in again
+    ]
+
+
+async def test__dry_run__previews_the_real_run_and_leaves_its_screenshots_for_it(env: Env) -> None:
+    igdb = FakeIgdb([make_game(1)])
+    request = SlotRequest(slots=range(1, 3))
+
+    planned = await env.builder(igdb, dry_run=True).run(request)
+
+    fetched = list(env.images.asked)
+    assert len(fetched) == 7
+    # A planned answer is taken, as a written one is (AC-25): slot 2 has nothing left to draw.
+    assert [(o.status, o.detail) for o in planned.outcomes] == [
+        (SlotStatus.PLANNED, ""),
+        (SlotStatus.FAILED, "no_candidate"),
+    ]
+    assert planned.outcomes[0].hint_steps == [2, 3, 4, 5, 6]
+
+    built = await env.builder(igdb).run(request)
+
+    assert [(o.status, o.detail) for o in built.outcomes] == [
+        (SlotStatus.BUILT, ""),
+        (SlotStatus.FAILED, "no_candidate"),
+    ]
+    assert built.outcomes[0].answer_name == planned.outcomes[0].answer_name
+    assert env.images.asked == fetched  # kept by image id in the working folder, not fetched again
+
+
+async def test__build__near_duplicates_are_counted_for_the_slot_that_met_them(env: Env) -> None:
+    games = [make_game(number) for number in (1, 2, 3, 4)]
+    for game in games[:3]:  # hand-made titles with these names and years: near-duplicates (R-20)
+        await create_title(env.db, name=game.name.upper(), year=game.release_year)
+    await env.db.commit()
+
+    report = await env.builder(FakeIgdb(games), dry_run=True).run(SlotRequest(slots=range(1, 3)))
+
+    # Slot 1 takes the only clean game; slot 2 meets all three near-duplicates, and only them.
+    assert [(o.slot, o.status, o.detail) for o in report.outcomes] == [
+        (1, SlotStatus.PLANNED, ""),
+        (2, SlotStatus.FAILED, "no_candidate"),
+    ]
+    assert report.outcomes[1].near_duplicates == 3
+
+
+async def test__build__rebuilds_of_two_slots_in_one_run_each_avoid_their_own_rejected_drafts(
+    env: Env,
+) -> None:
+    # 21 screenshots, two rejected drafts of 7 each per slot: exactly the last 7 remain.
+    games = [make_game(number, screenshots=21) for number in (1, 2)]
+    for game in games:
+        title = await create_title(env.db, name=game.name, igdb_id=game.id)
+        for first in (0, 7):
+            env.db.add(
+                AnswerExclusion(
+                    game_id=env.game_id,
+                    variant="default",
+                    title_id=title.id,
+                    reason="rebuild",
+                    build_slot=game.id,
+                    image_ids=[f"g{game.id}s{number:02d}" for number in range(first, first + 7)],
+                )
+            )
+    await env.db.commit()
+
+    report = await env.builder(FakeIgdb(games)).run(SlotRequest(rebuilds=True))
+
+    assert [(o.slot, o.status, o.is_rebuild) for o in report.outcomes] == [
+        (1, SlotStatus.BUILT, True),
+        (2, SlotStatus.BUILT, True),
+    ]
+    for slot in (1, 2):
+        clues = await clues_of(env.db, await puzzle_in_slot(env.db, slot))
+        used = {image_id for clue in clues for image_id in clue.source_image_ids or []}
+        assert used == {f"g{slot}s{number:02d}" for number in range(14, 21)}
+
+
+async def test__build__rebuild_rows_of_another_variant_neither_wait_nor_force_nor_give_up(
+    env: Env,
+) -> None:
+    rejected, other = make_game(7), make_game(8)
+    title = await create_title(env.db, name=rejected.name, igdb_id=rejected.id)
+    for reason, slot in (("rebuild", 5), ("never", None)):
+        env.db.add(
+            AnswerExclusion(
+                game_id=env.game_id,
+                variant="other" if reason == "rebuild" else "default",
+                title_id=title.id,
+                reason=reason,
+                build_slot=slot,
+                image_ids=["a"] if reason == "rebuild" else None,
+            )
+        )
+    await env.db.commit()
+    igdb = FakeIgdb([rejected, other])
+
+    waiting = await env.builder(igdb, dry_run=True).run(SlotRequest(rebuilds=True))
+    report = await env.builder(igdb, dry_run=True).run(SlotRequest(slots=range(5, 6)))
+
+    assert (waiting.slots, waiting.left_over) == ([], 0)  # no slot of this variant waits
+    assert (report.given_up, report.would_give_up) == ([], [])
+    outcome = report.outcomes[0]
+    assert (outcome.status, outcome.is_rebuild, outcome.answer_name) == (
+        SlotStatus.PLANNED, False, other.name,
+    )  # fmt: skip
+    assert await rows_by_reason(env) == {"rebuild": 1, "never": 1}
+
+
+async def test__build__rebuilds_that_wait_do_not_count_a_slot_that_already_has_its_puzzle(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(builder_module, "MAX_SLOTS_PER_RUN", 2)
+    title = await create_title(env.db, name="Waiting", igdb_id=3)
+    title_id = title.id
+    for slot in (1, 2, 3, 4):  # the rows of slot 2 stay after its rebuild was built (decision 71)
+        await add_rebuild_rows(env, slot, title)
+    game = await env.db.get(Game, env.game_id)
+    answer = await env.db.get(Title, title_id)
+    assert game is not None and answer is not None
+    rebuilt = await create_puzzle(
+        env.db, game=game, answer=answer, puzzle_date=dt.date(2026, 11, 1)
+    )
+    rebuilt.build_slot = 2
+    await env.db.commit()
+
+    report = await env.builder(FakeIgdb([]), dry_run=True).run(SlotRequest(rebuilds=True))
+
+    # Slots 1 and 3 are built, slot 4 waits; slot 2 is neither built nor waiting.
+    assert (report.slots, report.left_over) == ([1, 3], 1)
+    assert [outcome.slot for outcome in report.outcomes] == [1, 3]
+
+
+def test__slot_request__the_last_slot_number_and_the_largest_run_are_allowed() -> None:
+    none: set[int] = set()
+    assert SlotRequest(slots=range(MAX_SLOT_NUMBER, MAX_SLOT_NUMBER + 1)).pick(
+        puzzle_slots=none, rebuild_slots=none
+    ) == [MAX_SLOT_NUMBER]
+    assert len(SlotRequest(slots=range(1, 501)).pick(puzzle_slots=none, rebuild_slots=none)) == 500
+    assert SlotRequest(next_count=500).next_count == 500
+    with pytest.raises(ValueError):
+        SlotRequest(slots=range(MAX_SLOT_NUMBER + 1, MAX_SLOT_NUMBER + 2))
+    # `--next` may end on the last slot number, and not one past it.
+    one_before = {MAX_SLOT_NUMBER - 1}
+    assert SlotRequest(next_count=1).pick(puzzle_slots=one_before, rebuild_slots=none) == [
+        MAX_SLOT_NUMBER
+    ]
+    with pytest.raises(SlotLimitError):
+        SlotRequest(next_count=2).pick(puzzle_slots=one_before, rebuild_slots=none)
+
+
+@pytest.mark.parametrize("show_answers", [False, True], ids=["answers_hidden", "answers_shown"])
+def test__build_script__prints_a_planned_answer_only_when_asked_and_slots_in_order(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], show_answers: bool
+) -> None:
+    for name, value in {
+        "ENVIRONMENT": "local",
+        "IGDB_CLIENT_ID": "id",
+        "IGDB_CLIENT_SECRET": "a-long-test-client-secret-of-no-use",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("CI", raising=False)
+    script = load_script()
+
+    async def fills_the_report(*args: Any) -> None:
+        report = args[-1]
+        report.slots = [1, 2, 3]
+        report.outcomes += [
+            SlotOutcome(2, SlotStatus.EXISTS, "the slot already has a puzzle"),
+            SlotOutcome(3, SlotStatus.FAILED, "media_layout", answer_name="Secret Quest"),
+            SlotOutcome(1, SlotStatus.PLANNED, answer_name="Secret Quest", hint_steps=[2, 3]),
+        ]
+
+    monkeypatch.setattr(script, "run_build", fills_the_report)
+    argv = ["build_puzzles.py", "--target", "local", "--dry-run", "--next", "3"]
+    monkeypatch.setattr("sys.argv", [*argv, *(["--show-answers"] if show_answers else [])])
+
+    code = script.main()
+
+    captured = capsys.readouterr()
+    assert code == 1  # a failed slot
+    assert "Secret Quest" not in captured.err
+    # Not in any line of the report, a failure's included, unless the answers were asked for.
+    assert ("Secret Quest" in captured.out) == show_answers
+    assert (
+        captured.out.index("slot 1: planned") < captured.out.index("slot 2: exists")
+        < captured.out.index("slot 3: failed")
+    )  # fmt: skip
+    assert "hints at steps: 2, 3" in captured.out
+
+
+async def test__database_session__always_disposes_the_engine_and_a_failing_dispose_hides_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Engine:
+        disposed = 0
+        fails = False
+
+        async def dispose(self) -> None:
+            self.disposed += 1
+            if self.fails:
+                raise OSError("the pool is gone")
+
+    class Maker:
+        def __call__(self) -> "Maker":
+            return self
+
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+    engine = Engine()
+    monkeypatch.setattr("app.core.db.async_session_maker", Maker())
+    monkeypatch.setattr("app.core.db.engine", engine)
+
+    async with database_session():
+        pass
+    with pytest.raises(DatabaseFailure):
+        async with database_session():
+            raise ConnectionRefusedError("down")
+    assert engine.disposed == 2  # after a good run and after a failed one
+
+    engine.fails = True  # a dispose that fails neither fails a good run nor replaces an error
+    async with database_session():
+        pass
+    with pytest.raises(DatabaseFailure, match="ConnectionRefusedError"):
+        async with database_session():
+            raise ConnectionRefusedError("down")
+    assert engine.disposed == 4
 
 
 # Storage writer -----------------------------------------------------------------------------
