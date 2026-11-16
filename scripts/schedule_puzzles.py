@@ -10,10 +10,13 @@ game's launch date, in the order they were approved. No two answers of one serie
 days, an answer never repeats, and the run stops at the first date nothing fits instead of leaving
 a hole (decision 69); approve more puzzles of other series and run it again. A puzzle that is not
 complete, or has a file missing in the target's storage, stays `approved` and is reported with the
-step (AC-58). Today and past dates are never touched (AC-59).
+step (AC-58); files are checked only for a puzzle the walk reaches. A puzzle whose answer is already
+used (scheduled in any variant, or on an old dated row) is never scheduled and is reported. Today
+and past dates are never touched (AC-59).
 
 `--unschedule DATE` moves the scheduled puzzle of that date back to `approved` and frees the date.
-It refuses today and past dates and a puzzle with stored games (AC-59, AC-86).
+It refuses today and past dates and a puzzle with stored games (AC-59, AC-86). The puzzle goes
+last in the approval queue, so the next scheduling run does not give it the same date again.
 
 `--target` is required, must equal the ENVIRONMENT variable, is printed before anything else, and a
 target other than `local` also needs `--confirm-target <name>`. Nothing runs in CI (AC-44). The
@@ -54,15 +57,23 @@ def report_lines(result: ScheduleResult, *, show_answers: bool) -> list[str]:
     lines = [f"first schedulable day: {result.first_day}"]
     for item in result.scheduled:
         answer = f"  {item.answer_name}" if show_answers else ""
-        lines.append(f"scheduled {item.date}: slot {item.build_slot}{answer}")
+        lines.append(
+            f"scheduled {item.date}: puzzle {item.puzzle_id}, slot {item.build_slot}{answer}"
+        )
     lines.append(f"scheduled {len(result.scheduled)} puzzle(s)")
     for problem in result.not_ready:
         steps = ", ".join(str(item) for item in problem.problems)
-        lines.append(f"not ready, stays approved: slot {problem.build_slot} ({steps})")
-    if result.repeats:
-        lines.append(f"approved puzzles whose answer is already scheduled: {len(result.repeats)}")
+        lines.append(
+            f"not ready, stays approved: puzzle {problem.puzzle_id}, slot {problem.build_slot}"
+            f" ({steps})"
+        )
+    for puzzle_id in result.repeats:
+        lines.append(f"not scheduled, its answer is already used: puzzle {puzzle_id}")
     for date in result.blocked_dates:
-        lines.append(f"passed {date}: a puzzle that is not scheduled has that date")
+        lines.append(
+            f"passed {date}: an old puzzle that is not scheduled holds that date"
+            " (re-run the dev seed, or set that row's date to NULL)"
+        )
     if result.stop_reason == StopReason.NOTHING_FITS:
         lines.append(
             f"stopped at {result.stopped_on}: no approved, ready puzzle fits that date"
@@ -72,22 +83,32 @@ def report_lines(result: ScheduleResult, *, show_answers: bool) -> list[str]:
         lines.append(f"stopped at --until: next date would be {result.stopped_on}")
     else:
         lines.append("stopped: no approved, ready puzzle is left")
-    lines.append(f"buffer: {result.buffer} day(s) with a ready puzzle from {result.first_day}")
+    lines.append(f"buffer: {result.buffer} day(s) with a ready puzzle from tomorrow")
+    if result.buffer_from_launch is not None:
+        lines.append(
+            f"before launch: {result.buffer_from_launch} day(s) with a ready puzzle from the"
+            f" launch date {result.first_day} (not the buffer of the check)"
+        )
     return lines
 
 
 async def run(args: argparse.Namespace) -> list[str]:
-    today = utc_today(get_now())
-    writer = build_media_writer(app_settings)
     async with database_session() as db:
         game = await get_game_by_slug(db, args.slug)
         if game is None:
             raise UnknownGameError(f"no game with the slug {args.slug!r} in the database")
         if args.unschedule is not None:
-            puzzle = await unschedule(db, game, args.unschedule, today=today)
+            puzzle = await unschedule(db, game, args.unschedule, now=get_now)
             await db.commit()
-            return [f"{args.unschedule}: back to approved (slot {puzzle.build_slot}); date is free"]
-        result = await schedule(db, game, writer.exists, today=today, until=args.until)
+            moved = f"puzzle {puzzle.id}, slot {puzzle.build_slot}"
+            return [
+                f"{args.unschedule}: back to approved ({moved}); the puzzle is last in the queue"
+            ]
+        # The storage is needed to schedule only, so an unschedule builds no writer.
+        writer = build_media_writer(app_settings)
+        result = await schedule(
+            db, game, writer.exists, today=utc_today(get_now()), until=args.until
+        )
         await db.commit()
     return report_lines(result, show_answers=args.show_answers)
 

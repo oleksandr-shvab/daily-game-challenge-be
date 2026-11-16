@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from app.games.modules.game_guesser import STEP_COUNT, clue_layout_problem
+from app.games.modules.game_guesser import STEP_COUNT, MediaFileLike, clue_layout_problem
 from app.media.signing import is_media_key
 
 
@@ -33,17 +33,6 @@ class Problem:
         return f"{self.kind} at step {self.step}"
 
 
-class _FileLike(Protocol):
-    @property
-    def role(self) -> str: ...
-
-    @property
-    def content_type(self) -> str: ...
-
-    @property
-    def key(self) -> str: ...
-
-
 class _ClueLike(Protocol):
     """A `PuzzleClue` row with its media files loaded, or any object shaped like it."""
 
@@ -54,7 +43,7 @@ class _ClueLike(Protocol):
     def media_type(self) -> str: ...
 
     @property
-    def media_files(self) -> Iterable[_FileLike]: ...
+    def media_files(self) -> Iterable[MediaFileLike]: ...
 
 
 def puzzle_problems(

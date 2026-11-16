@@ -135,8 +135,9 @@ class _MediaLayout:
     poster: MediaFileData | None
 
 
-class _MediaFileLike(Protocol):
-    """What the AC-13b rule reads of a file: `MediaFileData`, a media row or a builder input."""
+class MediaFileLike(Protocol):
+    """What the content code reads of a clue file: `MediaFileData`, a media row or a builder
+    input. The AC-13b rule reads `role` and `content_type`; readiness also reads `key`."""
 
     @property
     def role(self) -> str: ...
@@ -144,8 +145,11 @@ class _MediaFileLike(Protocol):
     @property
     def content_type(self) -> str: ...
 
+    @property
+    def key(self) -> str: ...
 
-def clue_layout_problem(step: int, media_type: str, files: Iterable[_MediaFileLike]) -> str | None:
+
+def clue_layout_problem(step: int, media_type: str, files: Iterable[MediaFileLike]) -> str | None:
     """The media rule of one clue (AC-13b), pure: why its files break it, or `None` when they
     hold. The view applies it on every read (`_media_layout`), and the builder, scheduling and the
     buffer check apply it to what they are about to store or count, so the rule has one copy."""

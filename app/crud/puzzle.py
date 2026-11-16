@@ -263,17 +263,31 @@ async def list_approved_puzzles(db: AsyncSession, game_id: int, variant: str) ->
     return list(result.unique().scalars())
 
 
-async def list_scheduled_puzzles_from(
-    db: AsyncSession, game_id: int, variant: str, from_date: dt.date
+async def list_dated_answers(db: AsyncSession, game_id: int) -> list[tuple[int, int]]:
+    """`(puzzle id, answer title id)` of every puzzle of the game that has a date, in every
+    variant and any status: the answers that are used, for the repeat rule. A dated puzzle that is
+    not scheduled (an old draft) counts, so its answer is never given a second date."""
+    result = await db.execute(
+        select(Puzzle.id, Puzzle.answer_title_id).where(
+            Puzzle.game_id == game_id, Puzzle.date.is_not(None)
+        )
+    )
+    return [(puzzle_id, title_id) for puzzle_id, title_id in result.all()]
+
+
+async def list_scheduled_puzzles_between(
+    db: AsyncSession, game_id: int, variant: str, start: dt.date, end: dt.date
 ) -> list[Puzzle]:
-    """The scheduled puzzles dated `from_date` or later, by date, with clues and media files."""
+    """The scheduled puzzles dated from `start` up to but not including `end`, by date, with clues
+    and media files."""
     result = await db.execute(
         select(Puzzle)
         .where(
             Puzzle.game_id == game_id,
             Puzzle.variant == variant,
             Puzzle.status == PuzzleStatus.SCHEDULED,
-            Puzzle.date >= from_date,
+            Puzzle.date >= start,
+            Puzzle.date < end,
         )
         .options(*_WITH_ANSWER_AND_CLUES)
         .order_by(Puzzle.date)
@@ -281,16 +295,21 @@ async def list_scheduled_puzzles_from(
     return list(result.unique().scalars())
 
 
-async def get_scheduled_puzzle_on_date(
+async def lock_scheduled_puzzle_on_date(
     db: AsyncSession, game_id: int, variant: str, puzzle_date: dt.date
 ) -> Puzzle | None:
+    """The scheduled puzzle of the date, its row locked until the transaction ends and read fresh,
+    so the caller's checks and its write see the same row."""
     result = await db.execute(
-        select(Puzzle).where(
+        select(Puzzle)
+        .where(
             Puzzle.game_id == game_id,
             Puzzle.variant == variant,
             Puzzle.date == puzzle_date,
             Puzzle.status == PuzzleStatus.SCHEDULED,
         )
+        .with_for_update(of=Puzzle)
+        .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
 
@@ -310,9 +329,10 @@ async def set_puzzle_schedule(db: AsyncSession, puzzle: Puzzle, puzzle_date: dt.
     await db.flush()
 
 
-async def clear_puzzle_schedule(db: AsyncSession, puzzle: Puzzle) -> None:
-    """Scheduled back to approved, with no date. `approved_at` stays, so the puzzle keeps its
-    place in the approval order."""
+async def clear_puzzle_schedule(db: AsyncSession, puzzle: Puzzle, now: dt.datetime) -> None:
+    """Scheduled back to approved, with no date. `approved_at` becomes `now`: the puzzle goes to
+    the back of the queue, so the next scheduling run does not put it straight back."""
     puzzle.date = None
+    puzzle.approved_at = now
     puzzle.status = PuzzleStatus.APPROVED
     await db.flush()
