@@ -3,7 +3,9 @@ one `video/mp4`, at most one `video/webm` and one poster (an `image/webp`). The 
 steps on every read, so a broken puzzle fails at step 1, not when the player reaches step 6.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from app.core.exceptions import PuzzleDataError
 from app.games.enums import ClueContentType, ClueRole, GuessResult, MediaType, ProgressStatus
@@ -133,12 +135,25 @@ class _MediaLayout:
     poster: MediaFileData | None
 
 
-def _media_layout(puzzle: PuzzleData, clue: ClueData) -> _MediaLayout:
-    sources = [file for file in clue.media_files if file.role == ClueRole.SOURCE]
-    posters = [file for file in clue.media_files if file.role == ClueRole.POSTER]
+class _MediaFileLike(Protocol):
+    """What the AC-13b rule reads of a file: `MediaFileData`, a media row or a builder input."""
+
+    @property
+    def role(self) -> str: ...
+
+    @property
+    def content_type(self) -> str: ...
+
+
+def clue_layout_problem(step: int, media_type: str, files: Iterable[_MediaFileLike]) -> str | None:
+    """The media rule of one clue (AC-13b), pure: why its files break it, or `None` when they
+    hold. The view applies it on every read (`_media_layout`), and the builder, scheduling and the
+    buffer check apply it to what they are about to store or count, so the rule has one copy."""
+    files = list(files)
+    sources = [file for file in files if file.role == ClueRole.SOURCE]
+    posters = [file for file in files if file.role == ClueRole.POSTER]
     source_types = sorted(file.content_type for file in sources)
-    if clue.media_type == MediaType.VIDEO:
-        # "video/mp4" sorts before "video/webm"; WebM goes first in the view, so reverse it.
+    if media_type == MediaType.VIDEO:
         is_valid = (
             source_types
             in (
@@ -147,19 +162,28 @@ def _media_layout(puzzle: PuzzleData, clue: ClueData) -> _MediaLayout:
             )
             and len(posters) == 1
         )
-        ordered = sorted(sources, key=lambda file: file.content_type, reverse=True)
-    elif clue.media_type == MediaType.IMAGE:
+    elif media_type == MediaType.IMAGE:
         is_valid = source_types == [ClueContentType.IMAGE_WEBP] and not posters
-        ordered = sources
     else:
         is_valid = False
-        ordered = sources
-    if not is_valid:
-        raise PuzzleDataError(
-            f"Puzzle {puzzle.slug} {puzzle.date} step {clue.step} has {clue.media_type} media "
-            f"files {source_types} and {len(posters)} poster(s), which break AC-13b"
-        )
-    return _MediaLayout(sources=tuple(ordered), poster=posters[0] if posters else None)
+    if is_valid:
+        return None
+    return (
+        f"step {step} has {media_type} media files {source_types} and {len(posters)} poster(s), "
+        "which break AC-13b"
+    )
+
+
+def _media_layout(puzzle: PuzzleData, clue: ClueData) -> _MediaLayout:
+    problem = clue_layout_problem(clue.step, clue.media_type, clue.media_files)
+    if problem is not None:
+        raise PuzzleDataError(f"Puzzle {puzzle.slug} {puzzle.date} {problem}")
+    sources = [file for file in clue.media_files if file.role == ClueRole.SOURCE]
+    posters = [file for file in clue.media_files if file.role == ClueRole.POSTER]
+    if clue.media_type == MediaType.VIDEO:
+        # "video/mp4" sorts before "video/webm"; WebM goes first in the view, so reverse it.
+        sources.sort(key=lambda file: file.content_type, reverse=True)
+    return _MediaLayout(sources=tuple(sources), poster=posters[0] if posters else None)
 
 
 def _step_view(
