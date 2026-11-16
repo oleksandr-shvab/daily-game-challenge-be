@@ -11,3 +11,8 @@ __pycache__/
 
 # Local clue media written by the dev seed (MEDIA_LOCAL_DIR)
 var/media/
+
+# The puzzle builder's working folder and the media folder of the content database (AC-43). Raw
+# screenshots and drafts never go into Git.
+var/content-work/
+var/content-media/

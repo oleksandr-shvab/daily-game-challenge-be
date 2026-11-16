@@ -89,6 +89,17 @@ def check_target(
     return Target(name=target, database_host=host, storage=_storage_description(app_settings))
 
 
+def check_image_gate(target: str, cleared_by: str | None) -> None:
+    """No IGDB screenshot leaves `local` while `IGDB_IMAGES_CLEARED_BY` is empty (R-12, AC-2).
+    Raise `TargetRefusedError` for any other target then. Every script that stores an IGDB
+    screenshot (the builder, promote) calls this before it fetches or writes anything."""
+    if target != LOCAL_TARGET and not (cleared_by or "").strip():
+        raise TargetRefusedError(
+            f"IGDB images may not go to {target!r} while IGDB_IMAGES_CLEARED_BY is empty"
+            " (AC-2): build and review in 'local'"
+        )
+
+
 def refusal_reason(*, needs_local_storage: bool = True) -> str | None:
     """Why a script that deletes data must not run here, or None: the rules of the target
     `local`. It reads the ENVIRONMENT variable itself, so `.env` cannot make it pass by accident.
