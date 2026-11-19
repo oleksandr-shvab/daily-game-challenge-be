@@ -8,7 +8,9 @@ AC-2, AC-44; owner decision 68, R-10).
 
 Review stays in `local`; this is how an approved puzzle reaches the target, as `approved` with no
 date (rows and files). The target is the environment the `.env` and the ENVIRONMENT variable name
-(`DATABASE_URL`, `MEDIA_STORAGE`, `S3_*`); the source is only read. Run the title import on the
+(`DATABASE_URL`, `MEDIA_STORAGE`, `S3_*`); the source is only read, and a relative
+`--source-media-dir` is read from the backend repo root (as `MEDIA_LOCAL_DIR` is), not from the
+working directory. Run the title import on the
 target first, and `manage_game.py` if the game is not there yet. A slot the target already has is
 left alone, so a re-run adds nothing, and a puzzle with stored games is never touched (AC-86). A
 puzzle that is not ready, whose answer is missing from the target's titles or is already used there
@@ -59,7 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-database-url", required=True, help="the reviewed database, postgresql+asyncpg://"
     )
     parser.add_argument(
-        "--source-media-dir", required=True, type=Path, help="the folder of its media files"
+        "--source-media-dir",
+        required=True,
+        type=Path,
+        help="the folder of its media files; a relative path is read from the backend repo root",
     )
     parser.add_argument("--show-answers", action="store_true", help="print the answers' names")
     return parser
@@ -76,6 +81,9 @@ def source_description(url: str) -> str:
 
 def main() -> int:
     args = build_parser().parse_args()
+    # Like `settings.media_local_path`: a relative folder is read from the repo root, not from the
+    # working directory the command happens to run in.
+    source_dir = ROOT / args.source_media_dir
     cleared_by = ContentSettings().IGDB_IMAGES_CLEARED_BY
     report = PromoteReport()
     error_message: str | None = None
@@ -91,8 +99,7 @@ def main() -> int:
         print(target.describe())
         print(f"IGDB images cleared by: {cleared_by or 'nobody (local only)'}")
         print(
-            f"Source: database {source_description(args.source_database_url)};"
-            f" folder {args.source_media_dir}"
+            f"Source: database {source_description(args.source_database_url)}; folder {source_dir}"
         )
         writer = build_media_writer(app_settings)
         is_started = True
@@ -100,7 +107,7 @@ def main() -> int:
             run_promote(
                 slug=args.slug,
                 source_url=args.source_database_url,
-                source_dir=args.source_media_dir,
+                source_dir=source_dir,
                 target_name=target.name,
                 target_url=app_settings.DATABASE_URL,
                 cleared_by=cleared_by,

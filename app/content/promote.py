@@ -33,23 +33,19 @@ Library code: it returns a `PromoteReport` and the script prints it. No answer i
 lines unless asked for.
 """
 
-import asyncio
 import contextlib
 import datetime as dt
-import hashlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-from av.error import FFmpegError
-from PIL import Image, UnidentifiedImageError
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import ArgumentError
+from sqlalchemy.exc import ArgumentError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.content.builder import DatabaseFailure, UnknownGameError, database_errors, database_session
-from app.content.media import MediaFacts, MediaLimitError, broken_limits, measure
+from app.content.media import MediaFacts, broken_limits, measure
 from app.content.readiness import puzzle_problems
 from app.content.target import LOCAL_HOSTS, check_image_gate
 from app.crud.game import get_game_by_slug
@@ -62,23 +58,22 @@ from app.crud.puzzle import (
     list_slot_answers,
 )
 from app.crud.title import get_titles_by_igdb_ids
-from app.media.writer import LocalMediaWriter, MediaWriteError, MediaWriter
+from app.media.hashing import sha256_file
+from app.media.writer import LocalMediaWriter, MediaWriter, storage_call
 from app.models.puzzle import Puzzle, PuzzleStatus
-
-HASH_CHUNK_BYTES = 1024 * 1024
-# A file that is not what it claims to be: this is a refusal of the puzzle, not a failed run. A plain
-# `OSError` (the file cannot be read) is a storage error, so `UnidentifiedImageError`, which is an
-# `OSError` too, is named first.
-BAD_FILE_ERRORS = (
-    MediaLimitError,
-    FFmpegError,
-    Image.DecompressionBombError,
-    UnidentifiedImageError,
-)
 
 
 class PromoteRefusedError(Exception):
     """The run cannot start: the setup is wrong. The message says why and holds no credential."""
+
+
+class SlotTakenError(Exception):
+    """Another writer took the slot between the plan and the insert. `igdb_id` is the IGDB id of
+    the answer it holds (None for a title that did not come from IGDB)."""
+
+    def __init__(self, igdb_id: int | None) -> None:
+        super().__init__("the slot was taken while the puzzle was being written")
+        self.igdb_id = igdb_id
 
 
 class SourceDatabaseFailure(DatabaseFailure):
@@ -112,7 +107,7 @@ class SourceClue:
     hint_kind: str | None
     hint_value: str | None
     source_url: str | None
-    source_image_ids: list[str]
+    source_image_ids: list[str] | None  # NULL stays NULL
     media_files: tuple[MediaFileInput, ...]
 
 
@@ -138,6 +133,8 @@ class PuzzleOutcome:
     status: PromoteStatus
     detail: str = ""
     answer_name: str = ""
+    # Files of an already promoted puzzle that the target had lost and this run put back.
+    repaired: int = 0
 
     def line(self, *, show_answers: bool) -> str:
         slot = "no slot" if self.build_slot is None else f"slot {self.build_slot}"
@@ -145,7 +142,8 @@ class PuzzleOutcome:
         if self.status == PromoteStatus.PROMOTED:
             return f"promoted {slot}{answer}"
         if self.status == PromoteStatus.ALREADY:
-            return f"already in the target, left alone: {slot}{answer}"
+            restored = f"; {self.repaired} file(s) put back" if self.repaired else ""
+            return f"already in the target, rows left alone: {slot}{answer}{restored}"
         return f"refused {slot}{answer}: {self.detail}"
 
 
@@ -169,7 +167,8 @@ class PromoteReport:
         lines.append(
             f"promoted {self.count(PromoteStatus.PROMOTED)},"
             f" already in the target {self.count(PromoteStatus.ALREADY)},"
-            f" refused {self.count(PromoteStatus.REFUSED)}"
+            f" refused {self.count(PromoteStatus.REFUSED)},"
+            f" files put back {sum(outcome.repaired for outcome in self.outcomes)}"
         )
         return lines
 
@@ -220,7 +219,7 @@ def _source_puzzle(row: Puzzle) -> SourcePuzzle:
                 hint_kind=clue.hint_kind,
                 hint_value=clue.hint_value,
                 source_url=clue.source_url,
-                source_image_ids=list(clue.source_image_ids or []),
+                source_image_ids=clue.source_image_ids,
                 media_files=tuple(
                     MediaFileInput(
                         role=file.role,
@@ -241,31 +240,37 @@ def _source_puzzle(row: Puzzle) -> SourcePuzzle:
 
 # ---- Checking and copying files ----
 
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(HASH_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
+# What a file really is, by key: its facts, or None when its bytes are not what the key names or
+# `measure` cannot read them. One run reads each file once, however many clues name it.
+Verified = dict[str, MediaFacts | None]
 
 
-def bad_file_step(puzzle: SourcePuzzle, source_dir: Path) -> int | None:
-    """The first step whose file is not what its row says, or None. The key is the SHA-256 of the
-    bytes (AC-41), `measure` reads the real facts from the bytes (AC-39), and they must be the
-    row's and meet the limits. Blocking: call it in a thread. A file that cannot be read raises
+def _measured(path: Path, key: str) -> MediaFacts | None:
+    """Hash first: bytes that are not the ones the key names are bad whatever they decode to.
+    `measure` then reads the facts from the bytes (AC-39). A decoder can fail in many ways
+    (`OSError` included), and once the hash has read the file those are all a bad file, not a
+    storage error. Blocking. A file that cannot be opened raises `OSError`."""
+    if sha256_file(path) != key:
+        return None
+    try:
+        return measure(path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def bad_file_step(puzzle: SourcePuzzle, source_dir: Path, verified: Verified) -> int | None:
+    """The first step whose file is not what its row says, or None: the facts must be the row's
+    and meet the limits. Blocking: call it in a thread. A file that cannot be read raises
     `OSError`."""
     for clue in puzzle.clues:
         for file in clue.media_files:
-            path = source_dir / file.key
-            try:
-                facts = measure(path)
-            except BAD_FILE_ERRORS:
-                return clue.step
+            if file.key not in verified:
+                verified[file.key] = _measured(source_dir / file.key, file.key)
+            facts = verified[file.key]
             row_facts = MediaFacts(
                 file.content_type, file.byte_size, file.width, file.height, file.duration_ms
             )
-            if _sha256(path) != file.key or facts != row_facts or broken_limits(facts):
+            if facts is None or facts != row_facts or broken_limits(facts):
                 return clue.step
     return None
 
@@ -285,13 +290,119 @@ def _clue_inputs(puzzle: SourcePuzzle) -> list[ClueInput]:
     ]
 
 
-async def _storage[T, **P](call: Callable[P, T], *args: P.args) -> T:
-    """A blocking storage or file call in a thread. An `OSError` becomes a `MediaWriteError`
-    here, before the target session's wrapper could take it for a database error."""
-    try:
-        return await asyncio.to_thread(call, *args)
-    except OSError as error:
-        raise MediaWriteError(f"a file cannot be read or stored: {type(error).__name__}") from error
+def _file_types(puzzle: SourcePuzzle) -> dict[str, str]:
+    """The puzzle's distinct files: key to content type."""
+    return {file.key: file.content_type for clue in puzzle.clues for file in clue.media_files}
+
+
+@dataclass
+class _Run:
+    """What one promote run knows while it walks the source's puzzles."""
+
+    db: AsyncSession
+    game_id: int
+    variant: str
+    source_dir: Path
+    writer: MediaWriter
+    title_ids: dict[int, int]
+    slot_answers: dict[int, int | None]
+    used: set[int]
+    verified: Verified = field(default_factory=dict)
+
+    async def source_problem(self, puzzle: SourcePuzzle) -> tuple[RefusalReason, str] | None:
+        """Why the puzzle's source cannot be copied: not ready, or a file that is not what its
+        row says. None when it can."""
+        source_files = LocalMediaWriter(self.source_dir)
+        problems = await storage_call(
+            "a source file cannot be read",
+            puzzle_problems,
+            puzzle.clues,
+            file_exists=source_files.exists,
+        )
+        if problems:
+            return RefusalReason.NOT_READY, f" ({', '.join(map(str, problems))})"
+        step = await storage_call(
+            "a source file cannot be read", bad_file_step, puzzle, self.source_dir, self.verified
+        )
+        return None if step is None else (RefusalReason.BAD_FILE, f" (at step {step})")
+
+    async def put_files(self, puzzle: SourcePuzzle, *, only_missing: bool) -> int:
+        """Store the puzzle's files in the target; returns how many were written. `put` does
+        nothing for a key that is there, so only the ones the target lacks cost a write."""
+        written = 0
+        for key, content_type in _file_types(puzzle).items():
+            if only_missing and await storage_call(
+                "a file cannot be read or stored", self.writer.exists, key
+            ):
+                continue
+            written += await storage_call(
+                "a file cannot be read or stored",
+                self.writer.put,
+                key,
+                self.source_dir / key,
+                content_type,
+            )
+        return written
+
+    async def repair(self, puzzle: SourcePuzzle) -> PuzzleOutcome:
+        """The slot has this answer already, so its rows stay as they are (AC-86). Files the
+        target has lost are put back from the source, after the same checks as a first copy."""
+        done = PuzzleOutcome(
+            puzzle.build_slot, PromoteStatus.ALREADY, answer_name=puzzle.answer_name
+        )
+        lost = [
+            key
+            for key in _file_types(puzzle)
+            if not await storage_call("a file cannot be read or stored", self.writer.exists, key)
+        ]
+        if not lost:
+            return done
+        problem = await self.source_problem(puzzle)
+        if problem is not None:
+            return _refused(puzzle, *problem)
+        done.repaired = await self.put_files(puzzle, only_missing=True)
+        return done
+
+    async def write(self, puzzle: SourcePuzzle, title_id: int) -> None:
+        """Files first, then the rows of one puzzle in one transaction: it exists whole or not at
+        all. A failure rolls the rows back and stops the run; the files stay (non-goal:
+        clean-up). The one failure that does not stop it: another writer took the slot while the
+        files were going up, which raises `SlotTakenError`."""
+        assert puzzle.build_slot is not None
+        await self.put_files(puzzle, only_missing=False)
+        try:
+            await add_built_puzzle(
+                self.db,
+                game_id=self.game_id,
+                variant=self.variant,
+                build_slot=puzzle.build_slot,
+                generator_version=puzzle.generator_version,
+                answer_title_id=title_id,
+                status=PuzzleStatus.APPROVED,
+                clues=_clue_inputs(puzzle),
+                approved_at=puzzle.approved_at,
+            )
+            await self.db.commit()
+        except IntegrityError:
+            await self._rollback()
+            now_there = await list_slot_answers(self.db, self.game_id, self.variant)
+            await self._rollback()
+            if puzzle.build_slot not in now_there:
+                raise  # Not the slot's unique key: something else is wrong.
+            raise SlotTakenError(now_there[puzzle.build_slot]) from None
+        except BaseException:
+            await self._rollback()
+            raise
+
+    async def _rollback(self) -> None:
+        # A failing rollback (the database is gone) never replaces the original error.
+        with contextlib.suppress(Exception):
+            await self.db.rollback()
+
+
+def _refused(puzzle: SourcePuzzle, reason: RefusalReason, extra: str = "") -> PuzzleOutcome:
+    detail = f"{reason}{extra}"
+    return PuzzleOutcome(puzzle.build_slot, PromoteStatus.REFUSED, detail, puzzle.answer_name)
 
 
 # ---- The promote run ----
@@ -317,93 +428,77 @@ async def promote(
         )
     if game.default_variant != source.variant:
         raise PromoteRefusedError("the target's default variant is not the source's")
-    game_id, variant = game.id, game.default_variant
     igdb_ids = {p.answer_igdb_id for p in source.puzzles if p.answer_igdb_id is not None}
     title_ids = {
         igdb: title.id for igdb, title in (await get_titles_by_igdb_ids(db, igdb_ids)).items()
     }
-    slot_answers = await list_slot_answers(db, game_id, variant)
-    used = await list_answer_igdb_ids(db, game_id)
+    run = _Run(
+        db=db,
+        game_id=game.id,
+        variant=game.default_variant,
+        source_dir=source_dir,
+        writer=writer,
+        title_ids=title_ids,
+        slot_answers=await list_slot_answers(db, game.id, game.default_variant),
+        used=await list_answer_igdb_ids(db, game.id),
+    )
     await db.rollback()  # No transaction stays open through the file work.
-    source_files = LocalMediaWriter(source_dir)
-
-    def refuse(puzzle: SourcePuzzle, reason: RefusalReason, extra: str = "") -> PuzzleOutcome:
-        detail = f"{reason}{extra}"
-        return PuzzleOutcome(puzzle.build_slot, PromoteStatus.REFUSED, detail, puzzle.answer_name)
-
     for puzzle in source.puzzles:
-        slot, igdb_id = puzzle.build_slot, puzzle.answer_igdb_id
-        done = PuzzleOutcome(slot, PromoteStatus.PROMOTED, answer_name=puzzle.answer_name)
-        if slot is None:
-            done = refuse(puzzle, RefusalReason.NO_SLOT)
-        elif igdb_id is None:
-            done = refuse(puzzle, RefusalReason.NO_IGDB_ID)
-        elif slot in slot_answers:
-            done.status = PromoteStatus.ALREADY
-            if slot_answers[slot] != igdb_id:
-                done = refuse(puzzle, RefusalReason.SLOT_TAKEN)
-        elif igdb_id in used:
-            done = refuse(puzzle, RefusalReason.ANSWER_USED)
-        elif igdb_id not in title_ids:
-            done = refuse(
-                puzzle, RefusalReason.TITLE_MISSING, " (run the title import on the target first)"
-            )
-        else:
-            problems = await _storage(
-                lambda puzzle=puzzle: puzzle_problems(puzzle.clues, file_exists=source_files.exists)
-            )
-            bad_step = None if problems else await _storage(bad_file_step, puzzle, source_dir)
-            if problems:
-                steps = ", ".join(map(str, problems))
-                done = refuse(puzzle, RefusalReason.NOT_READY, f" ({steps})")
-            elif bad_step is not None:
-                done = refuse(puzzle, RefusalReason.BAD_FILE, f" (at step {bad_step})")
-            else:
-                await _write(db, puzzle, game_id, variant, title_ids[igdb_id], source_dir, writer)
-                slot_answers[slot] = igdb_id
-                used.add(igdb_id)
-        report.outcomes.append(done)
+        report.outcomes.append(await _promote_one(run, puzzle))
     return report
 
 
-async def _write(
-    db: AsyncSession,
-    puzzle: SourcePuzzle,
-    game_id: int,
-    variant: str,
-    title_id: int,
-    source_dir: Path,
-    writer: MediaWriter,
-) -> None:
-    """Files first, then the rows of one puzzle in one transaction: it exists whole or not at all.
-    A failure rolls the rows back and stops the run; the files stay (non-goal: clean-up)."""
-    assert puzzle.build_slot is not None
-    keys = {file.key: file for clue in puzzle.clues for file in clue.media_files}
-    for key, file in keys.items():
-        await _storage(writer.put, key, source_dir / key, file.content_type)
-    try:
-        await add_built_puzzle(
-            db,
-            game_id=game_id,
-            variant=variant,
-            build_slot=puzzle.build_slot,
-            generator_version=puzzle.generator_version,
-            answer_title_id=title_id,
-            status=PuzzleStatus.APPROVED,
-            clues=_clue_inputs(puzzle),
-            approved_at=puzzle.approved_at,
+async def _promote_one(run: _Run, puzzle: SourcePuzzle) -> PuzzleOutcome:
+    slot, igdb_id = puzzle.build_slot, puzzle.answer_igdb_id
+    if slot is None:
+        return _refused(puzzle, RefusalReason.NO_SLOT)
+    if igdb_id is None:
+        return _refused(puzzle, RefusalReason.NO_IGDB_ID)
+    if slot in run.slot_answers:
+        return await _existing_slot(run, puzzle, run.slot_answers[slot])
+    if igdb_id in run.used:
+        return _refused(puzzle, RefusalReason.ANSWER_USED)
+    if igdb_id not in run.title_ids:
+        return _refused(
+            puzzle, RefusalReason.TITLE_MISSING, " (run the title import on the target first)"
         )
-        await db.commit()
-    except BaseException:
-        # A failing rollback (the database is gone) never replaces the original error.
-        with contextlib.suppress(Exception):
-            await db.rollback()
-        raise
+    problem = await run.source_problem(puzzle)
+    if problem is not None:
+        return _refused(puzzle, *problem)
+    try:
+        await run.write(puzzle, run.title_ids[igdb_id])
+    except SlotTakenError as taken:
+        run.slot_answers[slot] = taken.igdb_id
+        return await _existing_slot(run, puzzle, taken.igdb_id, files_are_there=True)
+    run.slot_answers[slot] = igdb_id
+    run.used.add(igdb_id)
+    return PuzzleOutcome(slot, PromoteStatus.PROMOTED, answer_name=puzzle.answer_name)
+
+
+async def _existing_slot(
+    run: _Run, puzzle: SourcePuzzle, held_by: int | None, *, files_are_there: bool = False
+) -> PuzzleOutcome:
+    """The target has a puzzle in the slot: the same answer is "already promoted" (its files are
+    repaired, its rows never touched), another answer is a conflict."""
+    if held_by != puzzle.answer_igdb_id:
+        return _refused(puzzle, RefusalReason.SLOT_TAKEN)
+    if files_are_there:  # This run has just put them up.
+        return PuzzleOutcome(
+            puzzle.build_slot, PromoteStatus.ALREADY, answer_name=puzzle.answer_name
+        )
+    return await run.repair(puzzle)
 
 
 def _same_database(first: str, second: str) -> bool:
-    one, two = make_url(first), make_url(second)
-    return (one.host, one.port or 5432, one.database) == (two.host, two.port or 5432, two.database)
+    """The same server and database name. Every spelling of this machine is one host, so
+    `localhost` and `127.0.0.1` on one port are the same server."""
+
+    def where(url: str) -> tuple[str, int, str | None]:
+        parsed = make_url(url)
+        host = LOCAL_HOSTS[0] if parsed.host in (None, *LOCAL_HOSTS) else parsed.host
+        return host, parsed.port or 5432, parsed.database
+
+    return where(first) == where(second)
 
 
 async def run_promote(

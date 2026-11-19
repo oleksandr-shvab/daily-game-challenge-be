@@ -9,7 +9,8 @@ This is how the owner sets the production launch date before Phase 5: scheduling
 later of tomorrow and that date. A game that is missing is created (`default_variant` `default`,
 video games, disabled unless `--enable`) and then needs `--launch-date`. With no option the
 command only prints the game's settings. The launch date does not move once any account has stored
-games on the game's puzzles.
+games, or a scheduled puzzle is visible (dated today or earlier), or a scheduled puzzle is dated
+before the new date.
 
 `--target` is required, must equal the ENVIRONMENT variable, is printed before anything else, and
 a target other than `local` also needs `--confirm-target <name>`. Nothing runs in CI (AC-44).
@@ -29,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 from app.content.builder import DatabaseFailure, database_session
 from app.content.game_settings import GameSettingsError, apply_game_settings
 from app.content.target import TargetRefusedError, check_target
+from app.core.clock import get_now, utc_today
 from app.crud.game import get_game_by_slug
 
 DEFAULT_SLUG = "game-guesser"
@@ -46,7 +48,11 @@ async def run(args: argparse.Namespace) -> list[str]:
             state = "enabled" if game.is_enabled else "disabled"
             return [f"{game.slug}: launch date {game.launch_date}, {state}"]
         change = await apply_game_settings(
-            db, args.slug, launch_date=args.launch_date, is_enabled=is_enabled
+            db,
+            args.slug,
+            launch_date=args.launch_date,
+            is_enabled=is_enabled,
+            today=utc_today(get_now()),
         )
         await db.commit()
     return change.lines()

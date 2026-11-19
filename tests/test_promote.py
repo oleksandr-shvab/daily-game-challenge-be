@@ -17,8 +17,8 @@ from typing import Any
 import asyncpg
 import pytest
 from PIL import Image
-from sqlalchemy import func, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from app.content import promote as promote_module
@@ -39,7 +39,7 @@ from app.core.db import Base
 from app.crud.puzzle import ClueInput, MediaFileInput, add_built_puzzle
 from app.crud.title import create_title
 from app.games.enums import ClueRole, MediaType
-from app.media.writer import LocalMediaWriter
+from app.media.writer import LocalMediaWriter, MediaWriteError
 from app.models.game import Game
 from app.models.progress import Progress
 from app.models.puzzle import ClueMediaFile, Puzzle, PuzzleClue, PuzzleStatus
@@ -48,10 +48,13 @@ from app.models.user import User
 from tests.conftest import _maintenance_url_and_db_name
 from tests.factories import create_game
 
-SEED_MEDIA = Path(__file__).resolve().parent.parent / "scripts" / "seed_media"
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+SEED_MEDIA = BACKEND_ROOT / "scripts" / "seed_media"
 APPROVED_AT = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.UTC)
 SOURCE_URL = settings.TEST_DATABASE_URL + "_src"
 SOURCE_ANSWER = "Source Answer Name"
+# A WebP header with nothing behind it: Pillow raises a plain `OSError` for it.
+JUNK_WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 junk-junk-junk"
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +149,7 @@ class World:
                 hint_kind=None if step == 3 else "year",
                 hint_value=None if step == 3 else str(2000 + step),
                 source_url=f"https://www.igdb.com/games/{name.lower().replace(' ', '-')}",
-                source_image_ids=[f"img{step}a", f"img{step}b"],
+                source_image_ids=None if step == 3 else [f"img{step}a", f"img{step}b"],
                 files=[own] if step == 5 else [self.stored[n] for n in files_of_step(step)],
             )
             for step in range(1, 7)
@@ -286,6 +289,18 @@ async def test__promote__copies_an_approved_puzzle_whole_and_a_second_run_adds_n
     assert (await world.count(Puzzle), await world.count(PuzzleClue)) == (1, 6)
     assert await world.count(ClueMediaFile) == 7
 
+    # The target lost its files: a re-run puts them back and leaves every row as it was.
+    rows_before = await media_rows(world.target_db)
+    for file in every_file:
+        (world.writer.directory / file.key).unlink()
+    repaired = await world.run()
+
+    assert [(o.status, o.repaired) for o in repaired.outcomes] == [(PromoteStatus.ALREADY, 7)]
+    assert "7 file(s) put back" in "\n".join(repaired.lines(show_answers=False))
+    assert all(world.writer.exists(file.key) for file in every_file)
+    assert await media_rows(world.target_db) == rows_before
+    assert (await world.count(Puzzle), await world.count(ClueMediaFile)) == (1, 7)
+
 
 # (b) Refusals: the puzzle is left out, the others go on ------------------------------------------
 
@@ -348,6 +363,24 @@ async def make_file_corrupt(world: World) -> None:
     path.write_bytes(bytes(data))
 
 
+async def make_file_undecodable_and_hash_mismatch(world: World) -> None:
+    # Junk under a key it does not match: refused on the hash, before `measure` can raise.
+    await world.add_target_title(10, "Wanted")
+    (world.source_dir / world.own[SOURCE_ANSWER].key).write_bytes(JUNK_WEBP)
+
+
+async def make_file_undecodable_but_hash_matches(world: World) -> None:
+    # The key is the junk's own SHA-256, so the hash passes and `measure` fails with a decoder
+    # `OSError`: still a bad file, not a storage error that stops the run.
+    await world.add_target_title(10, "Wanted")
+    old_key = world.own[SOURCE_ANSWER].key
+    new_key = hashlib.sha256(JUNK_WEBP).hexdigest()
+    (world.source_dir / new_key).write_bytes(JUNK_WEBP)
+    await world.source_db.execute(
+        update(ClueMediaFile).where(ClueMediaFile.key == old_key).values(key=new_key)
+    )
+
+
 @pytest.mark.parametrize(
     ("prepare", "reason", "slot"),
     [
@@ -355,9 +388,19 @@ async def make_file_corrupt(world: World) -> None:
         (make_answer_used, "answer_already_in_target", 41),
         (make_file_missing, "not_ready (missing_file at step 5)", 41),
         (make_file_corrupt, "bad_file (at step 5)", 41),
+        (make_file_undecodable_and_hash_mismatch, "bad_file (at step 5)", 41),
+        (make_file_undecodable_but_hash_matches, "bad_file (at step 5)", 41),
         (None, "title_missing_in_target (run the title import on the target first)", 41),
     ],
-    ids=["played_slot_taken", "answer_used", "file_missing", "file_corrupt", "title_missing"],
+    ids=[
+        "played_slot_taken",
+        "answer_used",
+        "file_missing",
+        "file_corrupt",
+        "undecodable_hash_mismatch",
+        "undecodable_hash_matches",
+        "title_missing",
+    ],
 )
 async def test__promote__refuses_the_puzzle_touches_nothing_and_goes_on_with_the_next(
     world: World, prepare: Callable[[World], Any] | None, reason: str, slot: int
@@ -431,6 +474,87 @@ async def test__promote__a_row_failure_rolls_back_the_puzzle_and_leaves_the_file
     assert report.outcomes == []
 
 
+# (c2) Another writer takes the slot while the files go up; a storage read error stops the run -----
+
+
+@pytest.mark.parametrize(
+    ("rival_igdb_id", "expected"),
+    [(10, PromoteStatus.ALREADY), (99, PromoteStatus.REFUSED), (None, None)],
+    ids=["same_answer", "other_answer", "not_the_slot"],
+)
+async def test__promote__a_slot_taken_during_the_run_is_reported_and_the_run_goes_on(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    rival_igdb_id: int | None,
+    expected: PromoteStatus | None,
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    await world.add_source_puzzle(42, 11, "Fine")
+    wanted = await world.add_target_title(10, "Wanted")
+    rival = await world.add_target_title(99, "Rival")
+    await world.add_target_title(11, "Fine")
+    wanted_id, rival_id = wanted.id, rival.id
+    real_add = add_built_puzzle
+    is_first = True
+
+    async def add_after_a_rival_commits(db: AsyncSession, **kwargs: Any) -> Any:
+        nonlocal is_first
+        if kwargs["build_slot"] == 41 and is_first:
+            is_first = False
+            if rival_igdb_id is not None:
+                # The rival is committed (to the test's outer transaction) before our insert.
+                title_id = wanted_id if rival_igdb_id == 10 else rival_id
+                await real_add(
+                    db,
+                    **{**kwargs, "answer_title_id": title_id, "clues": [], "approved_at": None},
+                )
+                await db.commit()
+            else:
+                # An integrity error that is not the slot's unique key.
+                raise IntegrityError("INSERT", {}, Exception("some other constraint"))
+        return await real_add(db, **kwargs)
+
+    monkeypatch.setattr(promote_module, "add_built_puzzle", add_after_a_rival_commits)
+    hashed: list[str] = []
+    real_sha = promote_module.sha256_file
+
+    def counting_sha(path: Path) -> str:
+        hashed.append(path.name)
+        return real_sha(path)
+
+    monkeypatch.setattr(promote_module, "sha256_file", counting_sha)
+
+    if expected is None:
+        with pytest.raises(IntegrityError):
+            await world.run()
+        return
+    report = await world.run()
+
+    first, second = report.outcomes
+    assert (first.build_slot, first.status) == (41, expected)
+    assert (second.build_slot, second.status) == (42, PromoteStatus.PROMOTED)
+    # Each file is read once for the whole run: the two puzzles share six of their seven.
+    assert len(hashed) == len(set(hashed)) == 8
+    # Our rows were rolled back: slot 41 holds the rival's empty puzzle only.
+    assert await world.count(PuzzleClue) == 6  # slot 42's
+    assert await world.count(Puzzle) == 2
+
+
+async def test__promote__a_file_that_cannot_be_read_is_a_storage_error_not_a_bad_file(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    await world.add_target_title(10, "Wanted")
+
+    def unreadable(path: Path) -> str:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(promote_module, "sha256_file", unreadable)
+
+    with pytest.raises(MediaWriteError, match="PermissionError"):
+        await world.run()
+
+
 # (d) The run's own checks come before anything is read ---------------------------------------
 
 
@@ -452,9 +576,10 @@ class Setup:
         (Setup(target="local"), SourceDatabaseFailure),
         (Setup(cleared_by="x", source_url=settings.TEST_DATABASE_URL + "_missing"), SourceDatabaseFailure),
         (Setup(cleared_by="x", target_url="postgresql+asyncpg://u:y@localhost:1/none"), PromoteRefusedError),
+        (Setup(cleared_by="x", target_url="postgresql+asyncpg://u:y@127.0.0.1:1/none"), PromoteRefusedError),
         (Setup(cleared_by="x", source_url="postgresql+asyncpg://u@db.example.com/none"), PromoteRefusedError),
     ],
-    ids=["gate_closed", "gate_closed_for_a_bucket", "gate_open", "local_needs_no_gate", "no_such_database", "same_database", "remote_source"],
+    ids=["gate_closed", "gate_closed_for_a_bucket", "gate_open", "local_needs_no_gate", "no_such_database", "same_database", "same_database_other_spelling", "remote_source"],
 )  # fmt: skip
 async def test__run_promote__the_gate_and_the_setup_come_before_the_source_is_read(
     tmp_path: Path, setup: Setup, error: type[Exception]
@@ -516,7 +641,6 @@ def load_script() -> ModuleType:
 def test__promote_script__guard_and_gate_refuse_with_exit_1(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
     argv: list[str],
     environ: dict[str, str],
     message: str,
@@ -529,7 +653,7 @@ def test__promote_script__guard_and_gate_refuse_with_exit_1(
     source = ["--source-database-url", "postgresql+asyncpg://u:secret@localhost:1/x"]
     monkeypatch.setattr(
         "sys.argv",
-        ["promote_puzzles.py", *argv, *source, "--source-media-dir", str(tmp_path)],
+        ["promote_puzzles.py", *argv, *source, "--source-media-dir", "var/p3_24c_relative"],
     )
 
     code = load_script().main()
@@ -537,4 +661,6 @@ def test__promote_script__guard_and_gate_refuse_with_exit_1(
     captured = capsys.readouterr()
     assert code == 1 and message in captured.err
     assert captured.out.startswith("Target: staging;") == has_target_line
+    # A relative folder is read from the repo root, whatever the working directory is.
+    assert (str(BACKEND_ROOT / "var/p3_24c_relative") in captured.out) == has_target_line
     assert "secret" not in captured.out + captured.err

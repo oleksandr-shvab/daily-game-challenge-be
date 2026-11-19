@@ -6,6 +6,7 @@ is the same bytes and `put` does nothing. Nothing is ever public: the local fold
 through signed links, and the bucket gets no ACL.
 """
 
+import asyncio
 import os
 import tempfile
 from collections.abc import Callable
@@ -34,6 +35,18 @@ class MediaWriter(Protocol):
         """Store the file at `path` under `key`. Returns False and writes nothing when the key is
         already there (AC-41)."""
         ...
+
+
+async def storage_call[T, **P](
+    message: str, call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """Run a blocking storage or file call in a thread. An `OSError` becomes a `MediaWriteError`
+    "<message>: <error class>", so an async caller's database session wrapper (which also catches
+    `OSError`) never takes it for a database error."""
+    try:
+        return await asyncio.to_thread(call, *args, **kwargs)
+    except OSError as error:
+        raise MediaWriteError(f"{message}: {type(error).__name__}") from error
 
 
 def write_atomically(path: Path, write: Callable[[BinaryIO], None]) -> None:

@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.game import Game
 from app.models.progress import Progress
-from app.models.puzzle import Puzzle
+from app.models.puzzle import Puzzle, PuzzleStatus
 from app.models.title import TitleKind
 
 
@@ -58,5 +58,19 @@ async def game_has_stored_games(db: AsyncSession, game_id: int) -> bool:
     """True when any account has progress on any puzzle of the game (AC-86)."""
     result = await db.execute(
         select(exists().where(Progress.puzzle_id == Puzzle.id, Puzzle.game_id == game_id))
+    )
+    return bool(result.scalar())
+
+
+async def has_scheduled_puzzle_on_or_before(db: AsyncSession, game_id: int, day: date) -> bool:
+    """True when any variant of the game has a scheduled puzzle dated `day` or earlier."""
+    result = await db.execute(
+        select(
+            exists().where(
+                Puzzle.game_id == game_id,
+                Puzzle.status == PuzzleStatus.SCHEDULED,
+                Puzzle.date <= day,
+            )
+        )
     )
     return bool(result.scalar())

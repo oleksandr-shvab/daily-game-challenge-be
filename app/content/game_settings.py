@@ -14,7 +14,13 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.crud.game import add_game, game_has_stored_games, get_game_by_slug, update_game_settings
+from app.crud.game import (
+    add_game,
+    game_has_stored_games,
+    get_game_by_slug,
+    has_scheduled_puzzle_on_or_before,
+    update_game_settings,
+)
 
 DEFAULT_VARIANT = "default"
 # The same rule as the `slug_format` CHECK of `games`.
@@ -59,12 +65,21 @@ class GameChange:
 
 
 async def apply_game_settings(
-    db: AsyncSession, slug: str, *, launch_date: dt.date | None, is_enabled: bool | None
+    db: AsyncSession,
+    slug: str,
+    *,
+    launch_date: dt.date | None,
+    is_enabled: bool | None,
+    today: dt.date,
 ) -> GameChange:
     """Create the game when it is missing (it then needs a launch date, and is disabled unless
-    `is_enabled`), or change what is given. A launch date that moves is refused once any puzzle of
-    the game has stored games: the view number counts from it and a dated puzzle before it is
-    hidden, so a player's finished game would change under them (AC-86, AC-62)."""
+    `is_enabled`), or change what is given. A launch date that moves is refused when it would
+    change what players have seen (AC-86, AC-62), and the message says which case applies:
+    - accounts have stored games on the game's puzzles;
+    - a scheduled puzzle is dated `today` or earlier: it is visible, and guests may have played it
+      (their games live in the browser until they sign in);
+    - a scheduled puzzle is dated before the new launch date: it would be hidden.
+    The view number counts from the launch date, so moving it renumbers every puzzle."""
     game = await get_game_by_slug(db, slug)
     if game is None:
         if SLUG_PATTERN.fullmatch(slug) is None:
@@ -80,13 +95,26 @@ async def apply_game_settings(
         )
         return GameChange(slug, True, created.launch_date, created.is_enabled, None, None)
     before = (game.launch_date, game.is_enabled)
-    if (
-        launch_date is not None
-        and launch_date != game.launch_date
-        and await game_has_stored_games(db, game.id)
-    ):
+    if launch_date is not None and launch_date != game.launch_date:
+        await _refuse_a_launch_date_that_changes_what_players_saw(db, game.id, launch_date, today)
+    await update_game_settings(db, game, launch_date=launch_date, is_enabled=is_enabled)
+    return GameChange(slug, False, game.launch_date, game.is_enabled, *before)
+
+
+async def _refuse_a_launch_date_that_changes_what_players_saw(
+    db: AsyncSession, game_id: int, new_date: dt.date, today: dt.date
+) -> None:
+    if await game_has_stored_games(db, game_id):
         raise GameSettingsError(
             "the launch date cannot move: accounts have stored games on this game's puzzles"
         )
-    await update_game_settings(db, game, launch_date=launch_date, is_enabled=is_enabled)
-    return GameChange(slug, False, game.launch_date, game.is_enabled, *before)
+    if await has_scheduled_puzzle_on_or_before(db, game_id, today):
+        raise GameSettingsError(
+            "the launch date cannot move: a scheduled puzzle is dated today or earlier, so it is"
+            " visible and guests may have played it"
+        )
+    if await has_scheduled_puzzle_on_or_before(db, game_id, new_date - dt.timedelta(days=1)):
+        raise GameSettingsError(
+            f"the launch date cannot move to {new_date}: a scheduled puzzle is dated before it and"
+            " would be hidden (unschedule it first)"
+        )
