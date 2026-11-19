@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.readiness import Problem, puzzle_problems
 from app.core.clock import utc_today
+from app.crud.game import lock_game
 from app.crud.puzzle import (
     clear_puzzle_schedule,
     has_stored_games,
@@ -153,6 +154,9 @@ async def schedule(
     now: Callable[[], dt.datetime],
     until: dt.date | None = None,
 ) -> ScheduleResult:
+    # The launch date and the enabled flag are read under a share lock on the game's row, so a
+    # change by `manage_game.py` (an exclusive lock) and this run wait for each other.
+    game = await lock_game(db, game.id, is_shared=True)
     variant = game.default_variant
     today = utc_today(now())
     # `stop_reason` stays `POOL_EMPTY` unless the walk breaks out below.
@@ -266,21 +270,28 @@ async def unschedule(
 ) -> Puzzle:
     """Move the scheduled puzzle of `puzzle_date` back to `approved`, which frees the date (AC-59),
     and put it at the back of the approval queue (`approved_at` becomes now), so the next
-    scheduling run gives the date to another puzzle. Today's and past puzzles are visible and may
-    have stored games: never moved, whatever else is true (AC-86). Flushes, never commits.
+    scheduling run gives the date to another puzzle. Today's and past puzzles of an enabled game
+    are visible and may have stored games: never moved (AC-86). A disabled game shows nothing, so
+    its puzzles of any date can be moved back, which is how a launch date that moves later frees
+    the puzzles before it; the stored-games check stays in every case. Flushes, never commits.
 
-    `now` is a clock, called twice: once for the early refusal, and again after the puzzle's row is
-    locked, so a run that crosses 00:00 UTC (the puzzle has just become visible) is checked against
-    the time of the write, not the time of the start. Stored games are looked up under the same
-    lock, inside the same transaction. The row lock also holds back a new `progress` row for the
-    puzzle (its foreign key needs a share lock) until the transaction ends."""
-    if puzzle_date <= utc_today(now()):
+    The game's row is locked `FOR SHARE` first and read fresh (so the enabled flag cannot change
+    under the run). `now` is a clock, called twice: once for the early refusal, and again after
+    the puzzle's row is locked, so a run that crosses 00:00 UTC (the puzzle has just become
+    visible) is checked against the time of the write, not the time of the start. Stored games are
+    looked up under the same lock, inside the same transaction. The row lock also holds back a new
+    `progress` row for the puzzle (its foreign key needs a share lock) until the transaction
+    ends."""
+    game = await lock_game(db, game.id, is_shared=True)
+    is_locked_date = game.is_enabled
+    first_today = utc_today(now())
+    if is_locked_date and puzzle_date <= first_today:
         raise UnscheduleRefusedError(f"{puzzle_date} is today or past: it is locked (AC-59)")
     puzzle = await lock_scheduled_puzzle_on_date(db, game.id, game.default_variant, puzzle_date)
     if puzzle is None:
         raise UnscheduleRefusedError(f"no scheduled puzzle on {puzzle_date}")
     write_time = now()
-    if puzzle_date <= utc_today(write_time):
+    if is_locked_date and puzzle_date <= utc_today(write_time):
         raise UnscheduleRefusedError(f"{puzzle_date} is today or past: it is locked (AC-59)")
     if await has_stored_games(db, puzzle.id):
         raise UnscheduleRefusedError(f"the puzzle on {puzzle_date} has stored games (AC-86)")

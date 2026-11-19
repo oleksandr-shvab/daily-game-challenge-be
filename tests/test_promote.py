@@ -55,6 +55,7 @@ SOURCE_URL = settings.TEST_DATABASE_URL + "_src"
 SOURCE_ANSWER = "Source Answer Name"
 # A WebP header with nothing behind it: Pillow raises a plain `OSError` for it.
 JUNK_WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 junk-junk-junk"
+JUNK_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20
 
 
 @pytest.fixture(scope="module")
@@ -99,9 +100,14 @@ class CountingWriter:
         self.inner = LocalMediaWriter(directory)
         self.directory = directory
         self.puts: list[str] = []
+        # A bucket whose HEAD answers 403: it cannot say what it has.
+        self.cannot_tell = False
 
     def exists(self, key: str) -> bool:
         return self.inner.exists(key)
+
+    def exists_or_unknown(self, key: str) -> bool | None:
+        return None if self.cannot_tell else self.inner.exists(key)
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
         self.puts.append(key)
@@ -369,16 +375,21 @@ async def make_file_undecodable_and_hash_mismatch(world: World) -> None:
     (world.source_dir / world.own[SOURCE_ANSWER].key).write_bytes(JUNK_WEBP)
 
 
-async def make_file_undecodable_but_hash_matches(world: World) -> None:
+async def make_file_undecodable_but_hash_matches(world: World, junk: bytes = JUNK_WEBP) -> None:
     # The key is the junk's own SHA-256, so the hash passes and `measure` fails with a decoder
-    # `OSError`: still a bad file, not a storage error that stops the run.
+    # error: still a bad file, not a storage error that stops the run.
     await world.add_target_title(10, "Wanted")
     old_key = world.own[SOURCE_ANSWER].key
-    new_key = hashlib.sha256(JUNK_WEBP).hexdigest()
-    (world.source_dir / new_key).write_bytes(JUNK_WEBP)
+    new_key = hashlib.sha256(junk).hexdigest()
+    (world.source_dir / new_key).write_bytes(junk)
     await world.source_db.execute(
         update(ClueMediaFile).where(ClueMediaFile.key == old_key).values(key=new_key)
     )
+
+
+async def make_file_junk_mp4(world: World) -> None:
+    # An MP4 header with nothing behind it: PyAV raises a `ValueError` subclass, a content error.
+    await make_file_undecodable_but_hash_matches(world, junk=JUNK_MP4)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +401,7 @@ async def make_file_undecodable_but_hash_matches(world: World) -> None:
         (make_file_corrupt, "bad_file (at step 5)", 41),
         (make_file_undecodable_and_hash_mismatch, "bad_file (at step 5)", 41),
         (make_file_undecodable_but_hash_matches, "bad_file (at step 5)", 41),
+        (make_file_junk_mp4, "bad_file (at step 5)", 41),
         (None, "title_missing_in_target (run the title import on the target first)", 41),
     ],
     ids=[
@@ -399,6 +411,7 @@ async def make_file_undecodable_but_hash_matches(world: World) -> None:
         "file_corrupt",
         "undecodable_hash_mismatch",
         "undecodable_hash_matches",
+        "junk_mp4",
         "title_missing",
     ],
 )
@@ -474,36 +487,166 @@ async def test__promote__a_row_failure_rolls_back_the_puzzle_and_leaves_the_file
     assert report.outcomes == []
 
 
-# (c2) Another writer takes the slot while the files go up; a storage read error stops the run -----
+# (b2) An already promoted slot is repaired from the target's own rows, and never refused ------------
+
+
+async def lose_a_target_file_and_rebuild_the_source(world: World) -> str:
+    # The source was rebuilt: the slot's step-5 file has a new key, and the old file is gone from
+    # the source folder. The target lost the old file. Nothing can restore it.
+    old_key = world.own[SOURCE_ANSWER].key
+    rebuilt = world.own_file("Rebuilt")
+    await world.source_db.execute(
+        update(ClueMediaFile).where(ClueMediaFile.key == old_key).values(key=rebuilt.key)
+    )
+    (world.source_dir / old_key).unlink()
+    (world.writer.directory / old_key).unlink()
+    return rebuilt.key
+
+
+async def lose_a_target_file_and_corrupt_its_source_copy(world: World) -> str:
+    key = world.own[SOURCE_ANSWER].key
+    (world.writer.directory / key).unlink()
+    path = world.source_dir / key
+    data = bytearray(path.read_bytes())
+    data[-1] ^= 1
+    path.write_bytes(bytes(data))
+    return key
+
+
+async def lose_a_target_file_the_source_still_has(world: World) -> str:
+    (world.writer.directory / world.own[SOURCE_ANSWER].key).unlink()
+    return ""
+
+
+async def break_the_source_and_keep_the_target_healthy(world: World) -> str:
+    # The source slot is not ready now (a file is gone), but the target is whole.
+    (world.source_dir / world.own[SOURCE_ANSWER].key).unlink()
+    return ""
+
+
+async def lose_a_target_file_in_a_bucket_that_cannot_tell(world: World) -> str:
+    (world.writer.directory / world.own[SOURCE_ANSWER].key).unlink()
+    world.writer.cannot_tell = True
+    return ""
 
 
 @pytest.mark.parametrize(
-    ("rival_igdb_id", "expected"),
-    [(10, PromoteStatus.ALREADY), (99, PromoteStatus.REFUSED), (None, None)],
-    ids=["same_answer", "other_answer", "not_the_slot"],
+    ("prepare", "repaired", "lost", "is_unchecked"),
+    [
+        (lose_a_target_file_the_source_still_has, 1, 0, False),
+        (lose_a_target_file_and_rebuild_the_source, 0, 1, False),
+        (lose_a_target_file_and_corrupt_its_source_copy, 0, 1, False),
+        (break_the_source_and_keep_the_target_healthy, 0, 0, False),
+        (lose_a_target_file_in_a_bucket_that_cannot_tell, 0, 0, True),
+    ],
+    ids=["restored", "source_rebuilt", "source_copy_corrupt", "source_broken_target_healthy", "bucket_cannot_tell"],
+)  # fmt: skip
+async def test__promote__an_already_promoted_slot_is_never_refused_and_repairs_only_what_it_can(
+    world: World, prepare: Callable[[World], Any], repaired: int, lost: int, is_unchecked: bool
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    await world.add_target_title(10, "Wanted")
+    await world.run()
+    rows_before = await media_rows(world.target_db)
+    new_key = await prepare(world)
+    world.writer.puts.clear()
+
+    report = await world.run()
+
+    (outcome,) = report.outcomes
+    # Still "already in the target": the source copy is not looked at as a whole, and no row moves.
+    assert (outcome.status, outcome.repaired, outcome.lost, outcome.is_unchecked) == (
+        PromoteStatus.ALREADY,
+        repaired,
+        lost,
+        is_unchecked,
+    )
+    assert report.is_ok
+    assert await media_rows(world.target_db) == rows_before
+    # Only the file the target's own row names is put back, and only from a source file with that
+    # key: not the rebuilt source's new file, not a file whose bytes are not its key.
+    assert world.writer.puts == ([world.own[SOURCE_ANSWER].key] if repaired else [])
+    assert new_key == "" or not world.writer.exists(new_key)
+    if lost:
+        assert not world.writer.exists(world.own[SOURCE_ANSWER].key)
+    if is_unchecked:
+        assert "repair skipped" in "\n".join(report.lines(show_answers=False))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected", "message"),
+    [
+        (PermissionError(13, "denied"), PermissionError, "denied"),
+        (RuntimeError("a bug"), MediaWriteError, "RuntimeError"),
+    ],
+    ids=["read_error", "not_a_content_error"],
 )
-async def test__promote__a_slot_taken_during_the_run_is_reported_and_the_run_goes_on(
+async def test__bad_file_step__only_content_errors_are_a_bad_file_and_nothing_else_is_cached(
     world: World,
     monkeypatch: pytest.MonkeyPatch,
-    rival_igdb_id: int | None,
-    expected: PromoteStatus | None,
+    error: Exception,
+    expected: type[Exception],
+    message: str,
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    puzzle = (await read_source(world.source_db, "game-guesser")).puzzles[0]
+    monkeypatch.setattr(promote_module, "measure", lambda path: (_ for _ in ()).throw(error))
+    verified: promote_module.Verified = {}
+
+    with pytest.raises(expected, match=message):
+        promote_module.bad_file_step(puzzle, world.source_dir, verified)
+
+    assert verified == {}  # a failure that says nothing about the file is never remembered
+
+
+# (c2) Another writer takes the slot while the files go up; a storage read error stops the run -----
+
+
+@dataclass
+class Race:
+    """What another writer does to slot 41 while its files go up."""
+
+    rival_igdb_id: int | None  # the answer it puts there; None: an integrity error of another kind
+    first: PromoteStatus | None = None  # slot 41's outcome; None when the run stops
+    third: PromoteStatus | None = None  # slot 43, whose answer is 99
+    hashes: int = 0  # the files read: 6 are shared by all puzzles, each has one of its own
+    puzzles: int = 0  # the target's puzzles at the end
+    reread_fails: bool = False
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        # Same answer: already promoted. 99 stays free, so slot 43 goes through.
+        Race(10, PromoteStatus.ALREADY, PromoteStatus.PROMOTED, hashes=9, puzzles=3),
+        # Another answer: refused, and 99 is used from now on, so slot 43 is refused as well.
+        Race(99, PromoteStatus.REFUSED, PromoteStatus.REFUSED, hashes=8, puzzles=2),
+        Race(None),
+        Race(10, reread_fails=True),
+    ],
+    ids=["same_answer", "other_answer", "not_the_slot", "reread_fails"],
+)
+async def test__promote__a_slot_taken_during_the_run_is_reported_and_the_run_goes_on(
+    world: World, monkeypatch: pytest.MonkeyPatch, race: Race
 ) -> None:
     await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
     await world.add_source_puzzle(42, 11, "Fine")
+    await world.add_source_puzzle(43, 99, "Third")
     wanted = await world.add_target_title(10, "Wanted")
     rival = await world.add_target_title(99, "Rival")
     await world.add_target_title(11, "Fine")
     wanted_id, rival_id = wanted.id, rival.id
     real_add = add_built_puzzle
     is_first = True
+    events: list[str] = []
 
     async def add_after_a_rival_commits(db: AsyncSession, **kwargs: Any) -> Any:
         nonlocal is_first
         if kwargs["build_slot"] == 41 and is_first:
             is_first = False
-            if rival_igdb_id is not None:
+            if race.rival_igdb_id is not None:
                 # The rival is committed (to the test's outer transaction) before our insert.
-                title_id = wanted_id if rival_igdb_id == 10 else rival_id
+                title_id = wanted_id if race.rival_igdb_id == 10 else rival_id
                 await real_add(
                     db,
                     **{**kwargs, "answer_title_id": title_id, "clues": [], "approved_at": None},
@@ -512,6 +655,7 @@ async def test__promote__a_slot_taken_during_the_run_is_reported_and_the_run_goe
             else:
                 # An integrity error that is not the slot's unique key.
                 raise IntegrityError("INSERT", {}, Exception("some other constraint"))
+        events.append("add")
         return await real_add(db, **kwargs)
 
     monkeypatch.setattr(promote_module, "add_built_puzzle", add_after_a_rival_commits)
@@ -524,20 +668,47 @@ async def test__promote__a_slot_taken_during_the_run_is_reported_and_the_run_goe
 
     monkeypatch.setattr(promote_module, "sha256_file", counting_sha)
 
-    if expected is None:
+    if race.reread_fails:
+        real_read = promote_module.list_slot_answers
+        reads = 0
+        real_rollback = world.target_db.rollback
+
+        async def read_that_fails_the_second_time(*args: Any) -> Any:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                events.append("read")
+                raise SQLAlchemyError("the read fails")
+            return await real_read(*args)
+
+        async def counting_rollback() -> None:
+            events.append("rollback")
+            await real_rollback()
+
+        monkeypatch.setattr(promote_module, "list_slot_answers", read_that_fails_the_second_time)
+        monkeypatch.setattr(world.target_db, "rollback", counting_rollback)
+        events.append("start")
+        with pytest.raises(SQLAlchemyError, match="the read fails"):
+            await world.run()
+        # The failed read still ends its transaction with a rollback.
+        assert events[-3:] == ["rollback", "read", "rollback"]
+        return
+    if race.first is None:
         with pytest.raises(IntegrityError):
             await world.run()
         return
     report = await world.run()
 
-    first, second = report.outcomes
-    assert (first.build_slot, first.status) == (41, expected)
+    first, second, third = report.outcomes
+    assert (first.build_slot, first.status) == (41, race.first)
     assert (second.build_slot, second.status) == (42, PromoteStatus.PROMOTED)
-    # Each file is read once for the whole run: the two puzzles share six of their seven.
-    assert len(hashed) == len(set(hashed)) == 8
-    # Our rows were rolled back: slot 41 holds the rival's empty puzzle only.
-    assert await world.count(PuzzleClue) == 6  # slot 42's
-    assert await world.count(Puzzle) == 2
+    assert (third.build_slot, third.status) == (43, race.third)
+    if race.third == PromoteStatus.REFUSED:
+        assert third.detail == "answer_already_in_target"
+    # Each file is read once for the whole run, however many puzzles share it.
+    assert len(hashed) == len(set(hashed)) == race.hashes
+    # Our rows for slot 41 were rolled back: it holds the rival's empty puzzle only.
+    assert await world.count(Puzzle) == race.puzzles
 
 
 async def test__promote__a_file_that_cannot_be_read_is_a_storage_error_not_a_bad_file(

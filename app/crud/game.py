@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from datetime import date
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.game import Game
@@ -24,6 +24,19 @@ async def get_game_by_slug(db: AsyncSession, slug: str) -> Game | None:
     """The game whether it is enabled or not: the content tools work on a disabled game too."""
     result = await db.execute(select(Game).where(Game.slug == slug))
     return result.scalar_one_or_none()
+
+
+async def lock_game(db: AsyncSession, game_id: int, *, is_shared: bool) -> Game:
+    """The game row read fresh and locked until the transaction ends. `is_shared` is `FOR SHARE`:
+    scheduling and unscheduling read the launch date and the enabled flag under it, and a change
+    of either (`FOR UPDATE`, `manage_game.py`) waits for them, and they for it."""
+    result = await db.execute(
+        select(Game)
+        .where(Game.id == game_id)
+        .with_for_update(read=is_shared)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one()
 
 
 async def add_game(
@@ -74,3 +87,15 @@ async def has_scheduled_puzzle_on_or_before(db: AsyncSession, game_id: int, day:
         )
     )
     return bool(result.scalar())
+
+
+async def count_scheduled_puzzles_before(db: AsyncSession, game_id: int, day: date) -> int:
+    """The game's scheduled puzzles, any variant, dated before `day`."""
+    result = await db.execute(
+        select(func.count()).where(
+            Puzzle.game_id == game_id,
+            Puzzle.status == PuzzleStatus.SCHEDULED,
+            Puzzle.date < day,
+        )
+    )
+    return result.scalar_one()

@@ -157,6 +157,23 @@ async def list_slot_answers(db: AsyncSession, game_id: int, variant: str) -> dic
     return {slot: igdb_id for slot, igdb_id in result.all()}
 
 
+async def list_slot_media_keys(
+    db: AsyncSession, game_id: int, variant: str
+) -> dict[int, dict[str, str]]:
+    """For each build slot that has a puzzle, the media keys its rows name, each with its content
+    type. Promote repairs a slot's files from these, the target's own rows."""
+    result = await db.execute(
+        select(Puzzle.build_slot, ClueMediaFile.key, ClueMediaFile.content_type)
+        .join(PuzzleClue, PuzzleClue.puzzle_id == Puzzle.id)
+        .join(ClueMediaFile, ClueMediaFile.clue_id == PuzzleClue.id)
+        .where(Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.build_slot.is_not(None))
+    )
+    keys: dict[int, dict[str, str]] = {}
+    for slot, key, content_type in result.all():
+        keys.setdefault(slot, {})[key] = content_type
+    return keys
+
+
 @dataclass(frozen=True)
 class MediaFileInput:
     role: str
