@@ -104,9 +104,9 @@ class ScheduleResult:
     stop_reason: StopReason = StopReason.POOL_EMPTY
     # The date nothing fit (`NOTHING_FITS`), or the first date past `until` (`UNTIL`).
     stopped_on: dt.date | None = None
-    # Consecutive days from tomorrow with a ready scheduled puzzle (AC-75, as the M1-25 check
-    # counts it), and, only while the launch date is later than tomorrow, the same count from the
-    # launch date.
+    # Consecutive days from tomorrow with a ready scheduled puzzle (AC-75), and, only while the
+    # launch date is later than tomorrow, the same count from the launch date, which is the number
+    # the M1-25 check reports then (it counts from `first_day`).
     buffer: int = 0
     buffer_from_launch: int | None = None
 
@@ -138,7 +138,7 @@ def _drop_repeats(pool: list[Puzzle], used_titles: set[int], repeats: list[int])
     return [puzzle for puzzle in pool if puzzle.answer_title_id not in used_titles]
 
 
-async def _problems(puzzle: Puzzle, file_exists: Callable[[str], bool]) -> list[Problem]:
+async def readiness_problems(puzzle: Puzzle, file_exists: Callable[[str], bool]) -> list[Problem]:
     try:
         return await asyncio.to_thread(puzzle_problems, puzzle.clues, file_exists=file_exists)
     except OSError as error:
@@ -193,7 +193,7 @@ async def schedule(
         for puzzle in list(pool):
             if not _fits(puzzle, day, placed):
                 continue
-            problems = await _problems(puzzle, file_exists)
+            problems = await readiness_problems(puzzle, file_exists)
             problems_by_id[puzzle.id] = problems
             if problems:
                 # AC-58: it stays approved and is reported; it does not hold the date back.
@@ -219,9 +219,9 @@ async def schedule(
         day += ONE_DAY
 
     tomorrow = today + ONE_DAY
-    result.buffer = await _buffer(db, game, tomorrow, file_exists, problems_by_id)
+    result.buffer = await ready_buffer(db, game, tomorrow, file_exists, problems_by_id)
     if result.first_day > tomorrow:
-        result.buffer_from_launch = await _buffer(
+        result.buffer_from_launch = await ready_buffer(
             db, game, result.first_day, file_exists, problems_by_id
         )
     # The run reads storage and can last minutes. If 00:00 UTC passed, the first day it scheduled
@@ -233,7 +233,7 @@ async def schedule(
     return result
 
 
-async def _buffer(
+async def ready_buffer(
     db: AsyncSession,
     game: Game,
     start: dt.date,
@@ -242,7 +242,8 @@ async def _buffer(
 ) -> int:
     """The consecutive days from `start` that have a ready scheduled puzzle, up to `BUFFER_CAP`
     (AC-60, AC-75). A gap, or a puzzle that is not ready, ends the count. Only the days that can
-    count are read."""
+    count are read. The one buffer count: `schedule` and the M1-25 check (`buffer_check.py`) both
+    call it. `problems_by_id` is a cache of puzzles already checked; the call adds to it."""
     by_date = {
         puzzle.date: puzzle
         for puzzle in await list_scheduled_puzzles_between(
@@ -254,7 +255,7 @@ async def _buffer(
     while days < BUFFER_CAP and day in by_date:
         puzzle = by_date[day]
         if puzzle.id not in problems_by_id:
-            problems_by_id[puzzle.id] = await _problems(puzzle, file_exists)
+            problems_by_id[puzzle.id] = await readiness_problems(puzzle, file_exists)
         if problems_by_id[puzzle.id]:
             break
         days += 1
