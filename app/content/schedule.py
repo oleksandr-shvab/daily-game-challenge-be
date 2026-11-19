@@ -23,7 +23,9 @@ could take, and once per puzzle. A not-ready puzzle is reported and leaves the p
 never reaches (after `until`, or kept back by the series rule) is not checked or reported.
 
 Library code: it flushes and never commits, so a run that fails half way changes nothing, and it
-prints nothing. The caller owns the transaction and shows the `ScheduleResult`. `file_exists` is
+prints nothing. The caller owns the transaction and shows the `ScheduleResult`. `now` is a clock,
+called at the start and again as the last step: a run that crosses 00:00 UTC and scheduled a date
+that is now today or earlier raises `ScheduleRefusedError`, and the caller rolls the run back. `file_exists` is
 blocking (`MediaWriter.exists`), so it is called in `asyncio.to_thread`; an `OSError` from it is a
 `MediaWriteError`, a storage error, not a database one.
 """
@@ -63,6 +65,10 @@ class StopReason(StrEnum):
     POOL_EMPTY = "pool_empty"
     NOTHING_FITS = "nothing_fits"
     UNTIL = "until"
+
+
+class ScheduleRefusedError(Exception):
+    """The run must not be kept: the day changed while it ran. The caller rolls back."""
 
 
 class UnscheduleRefusedError(Exception):
@@ -146,10 +152,11 @@ async def schedule(
     game: Game,
     file_exists: Callable[[str], bool],
     *,
-    today: dt.date,
+    now: Callable[[], dt.datetime],
     until: dt.date | None = None,
 ) -> ScheduleResult:
     variant = game.default_variant
+    today = utc_today(now())
     # `stop_reason` stays `POOL_EMPTY` unless the walk breaks out below.
     result = ScheduleResult(first_day=first_schedulable_day(game, today))
     dated = await list_dated_puzzles(db, game.id, variant)
@@ -216,6 +223,12 @@ async def schedule(
     if result.first_day > tomorrow:
         result.buffer_from_launch = await _buffer(
             db, game, result.first_day, file_exists, problems_by_id
+        )
+    # The run reads storage and can last minutes. If 00:00 UTC passed, the first day it scheduled
+    # may be today now, and visible: refuse the whole run (AC-59). The caller rolls back.
+    if result.scheduled and result.scheduled[0].date <= utc_today(now()):
+        raise ScheduleRefusedError(
+            "the day changed while the run was going and a puzzle it scheduled is today's now"
         )
     return result
 

@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.content.builder import DatabaseFailure, UnknownGameError, database_session
 from app.content.schedule import (
+    ScheduleRefusedError,
     ScheduleResult,
     StopReason,
     UnscheduleRefusedError,
@@ -45,7 +46,7 @@ from app.content.schedule import (
     unschedule,
 )
 from app.content.target import TargetRefusedError, check_target
-from app.core.clock import get_now, utc_today
+from app.core.clock import get_now
 from app.core.config import settings as app_settings
 from app.crud.game import get_game_by_slug
 from app.media.writer import MediaWriteError, build_media_writer
@@ -106,9 +107,8 @@ async def run(args: argparse.Namespace) -> list[str]:
             ]
         # The storage is needed to schedule only, so an unschedule builds no writer.
         writer = build_media_writer(app_settings)
-        result = await schedule(
-            db, game, writer.exists, today=utc_today(get_now()), until=args.until
-        )
+        # A `ScheduleRefusedError` leaves before the commit, so the whole run is rolled back.
+        result = await schedule(db, game, writer.exists, now=get_now, until=args.until)
         await db.commit()
     return report_lines(result, show_answers=args.show_answers)
 
@@ -150,6 +150,12 @@ def main() -> int:
         print("\n".join(asyncio.run(run(args))))
     except (TargetRefusedError, UnknownGameError, UnscheduleRefusedError) as error:
         print(f"schedule_puzzles: refusing to run: {error}", file=sys.stderr)
+        return 1
+    except ScheduleRefusedError as error:
+        print(
+            f"schedule_puzzles: {error}. Nothing was saved. Run it again.",
+            file=sys.stderr,
+        )
         return 1
     except DatabaseFailure as error:
         print(f"schedule_puzzles: database error: {error}", file=sys.stderr)

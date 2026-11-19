@@ -1,6 +1,6 @@
 """Scheduling and unscheduling (SPEC-04 AC-55 to AC-60, AC-86; decisions 68 to 71) and the
 readiness rule they use (AC-58). Real Postgres through `db_session`, a fake `file_exists`, an
-injected `today`. Rows say what is approved, what is already dated and what the walk must do."""
+injected clock. Rows say what is approved, what is already dated and what the walk must do."""
 
 import datetime as dt
 import importlib.util
@@ -15,6 +15,7 @@ from app.content import schedule as schedule_module
 from app.content.readiness import Problem, ProblemKind
 from app.content.schedule import (
     ScheduledPuzzle,
+    ScheduleRefusedError,
     ScheduleResult,
     StopReason,
     UnscheduleRefusedError,
@@ -69,6 +70,9 @@ class Row:
     blocked: list[int] = field(default_factory=list)
     buffer: int = 0
     buffer_from_launch: int | None = None
+    # The days the clock reads in turn (the walk, then the re-check), and whether the run is refused.
+    clock_days: tuple[int, ...] = (0,)
+    is_refused: bool = False
 
 
 def scheduled_puz(label: str, offset: int, franchise: str | None = None) -> Puz:
@@ -77,6 +81,20 @@ def scheduled_puz(label: str, offset: int, franchise: str | None = None) -> Puz:
 
 def approved(*labels: str, franchise: str | None = None) -> list[Puz]:
     return [Puz(label, franchise=franchise, rank=index) for index, label in enumerate(labels)]
+
+
+def clock(*offsets: int) -> Callable[[], dt.datetime]:
+    """A clock that reads noon UTC of TODAY plus each offset in turn, then stays on the last."""
+    readings = [dt.datetime.combine(day(offset), dt.time(12), tzinfo=dt.UTC) for offset in offsets]
+    index = 0
+
+    def now() -> dt.datetime:
+        nonlocal index
+        reading = readings[min(index, len(readings) - 1)]
+        index += 1
+        return reading
+
+    return now
 
 
 ZELDA = "zelda"
@@ -211,6 +229,10 @@ ROWS = {
         },
         buffer=1,
     ),
+    # Midnight passes during the run: the date it scheduled is today's at the re-check (AC-59).
+    "midnight_passes_during_the_run": Row(
+        approved("a"), [(1, "a")], StopReason.POOL_EMPTY, clock_days=(0, 1), is_refused=True
+    ),
     # A pool that holds only not-ready puzzles ends empty, not "nothing fits".
     "only_not_ready_puzzles": Row(
         [Puz("a", missing_step_6_file=True)],
@@ -264,13 +286,18 @@ async def test__schedule__fills_free_days_by_the_rules(db_session: AsyncSession,
     puzzles, missing = await create_row(db_session, game, row)
     labels = {puzzle.id: label for label, puzzle in puzzles.items()}
 
-    result = await schedule(
+    run = schedule(
         db_session,
         game,
         lambda key: key not in missing,
-        today=TODAY,
+        now=clock(*row.clock_days),
         until=day(row.until_offset) if row.until_offset is not None else None,
     )
+    if row.is_refused:
+        with pytest.raises(ScheduleRefusedError):
+            await run
+        return
+    result = await run
 
     assert [(item.date, labels[item.puzzle_id]) for item in result.scheduled] == [
         (day(offset), label) for offset, label in row.scheduled
@@ -292,20 +319,6 @@ async def test__schedule__fills_free_days_by_the_rules(db_session: AsyncSession,
                 puz.status,
                 None if puz.offset is None else day(puz.offset),
             )
-
-
-def clock(*offsets: int) -> Callable[[], dt.datetime]:
-    """A clock that reads noon UTC of TODAY plus each offset in turn, then stays on the last."""
-    readings = [dt.datetime.combine(day(offset), dt.time(12), tzinfo=dt.UTC) for offset in offsets]
-    index = 0
-
-    def now() -> dt.datetime:
-        nonlocal index
-        reading = readings[min(index, len(readings) - 1)]
-        index += 1
-        return reading
-
-    return now
 
 
 @pytest.mark.parametrize(
@@ -355,7 +368,7 @@ async def test__unschedule__then_schedule_gives_the_date_to_another_puzzle(
     waiting.approved_at = APPROVED_AT + dt.timedelta(hours=1)
 
     await unschedule(db_session, game, day(1), now=clock(0))
-    result = await schedule(db_session, game, lambda key: True, today=TODAY)
+    result = await schedule(db_session, game, lambda key: True, now=clock(0))
 
     assert [(item.date, item.puzzle_id) for item in result.scheduled] == [
         (day(1), waiting.id),
@@ -401,7 +414,7 @@ async def test__schedule__the_buffer_is_counted_from_tomorrow_up_to_the_cap(
             puzzle_date=day(offset),
         )
 
-    result = await schedule(db_session, game, lambda key: True, today=TODAY)
+    result = await schedule(db_session, game, lambda key: True, now=clock(0))
 
     # Days 1 and 2 are ready; day 3 is past the cap. The first puzzle is dated tomorrow.
     assert result.buffer == 2
@@ -422,7 +435,7 @@ async def test__schedule__a_storage_error_is_a_media_write_error(db_session: Asy
         raise PermissionError(f"no access to {key}")
 
     with pytest.raises(MediaWriteError) as error:
-        await schedule(db_session, game, unreadable_folder, today=TODAY)
+        await schedule(db_session, game, unreadable_folder, now=clock(0))
 
     # The message names the class only: no path, key or errno text.
     assert str(error.value) == "the storage cannot be read: PermissionError"
