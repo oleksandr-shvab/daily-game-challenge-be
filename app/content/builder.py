@@ -22,7 +22,6 @@ answer is in the report's lines unless asked for.
 import asyncio
 import contextlib
 import datetime as dt
-import hashlib
 import json
 import re
 import shutil
@@ -32,6 +31,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
+import asyncpg
 import httpx
 from av.error import FFmpegError
 from PIL import Image
@@ -72,7 +72,8 @@ from app.crud.puzzle import (
 from app.crud.title import create_title, find_key_holders, get_titles_by_igdb_ids
 from app.games.enums import ClueContentType, ClueRole, ExclusionReason, MediaType
 from app.games.modules.game_guesser import clue_layout_problem
-from app.media.writer import MediaWriteError, MediaWriter, write_atomically
+from app.media.hashing import sha256_file
+from app.media.writer import MediaWriter, storage_call, write_atomically
 from app.models.puzzle import PuzzleStatus
 from app.models.title import TitleKind
 
@@ -120,13 +121,15 @@ class DatabaseFailure(Exception):
 
 @contextlib.contextmanager
 def database_errors() -> Iterator[None]:
-    """Name an `SQLAlchemyError` or `OSError` raised inside the block `DatabaseFailure`. An
-    unreachable Postgres raises `ConnectionRefusedError`, an `OSError` like a file error, so what
-    is database work has to be named in one place. Storage and file work inside the block must be
-    classified before it gets here (`MediaWriteError`, a slot error), or it would be named wrongly."""
+    """Name an `SQLAlchemyError`, `OSError` or asyncpg error raised inside the block
+    `DatabaseFailure`. An unreachable Postgres raises `ConnectionRefusedError`, an `OSError` like a
+    file error, and a database or a password that is wrong raises an asyncpg error that SQLAlchemy
+    does not wrap when it comes from opening the connection, so what is database work has to be
+    named in one place. Storage and file work inside the block must be classified before it gets
+    here (`MediaWriteError`, a slot error), or it would be named wrongly."""
     try:
         yield
-    except (SQLAlchemyError, OSError) as error:
+    except (SQLAlchemyError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as error:
         raise DatabaseFailure(type(error).__name__) from error
 
 
@@ -355,11 +358,6 @@ class SlotPlan:
     is_rebuild: bool
 
 
-def _sha256(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
 def make_files(
     shots: ScreenshotPlan, raw: dict[str, Path], seed: SlotSeed, out_dir: Path
 ) -> list[BuiltFile]:
@@ -371,7 +369,7 @@ def make_files(
     built: list[BuiltFile] = []
 
     def add(step: int, role: str, path: Path, facts: MediaFacts) -> None:
-        built.append(BuiltFile(step, role, path, _sha256(path), facts))
+        built.append(BuiltFile(step, role, path, sha256_file(path), facts))
 
     path = out_dir / "step1.webp"
     add(
@@ -739,10 +737,13 @@ class Builder:
         """Store one file. A storage `OSError` is named a `MediaWriteError` here, before it can be
         taken for a database error by the session's wrapper."""
         assert self.writer is not None
-        try:
-            await asyncio.to_thread(self.writer.put, file.key, file.path, file.facts.content_type)
-        except OSError as error:
-            raise MediaWriteError(f"a file cannot be stored: {type(error).__name__}") from error
+        await storage_call(
+            "a file cannot be stored",
+            self.writer.put,
+            file.key,
+            file.path,
+            file.facts.content_type,
+        )
 
     async def _write(self, plan: SlotPlan, files: list[BuiltFile], clues: list[ClueInput]) -> None:
         """Files first, then the rows in one transaction (AC-46). A failure rolls the rows back and

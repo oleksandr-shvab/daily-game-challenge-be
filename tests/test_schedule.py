@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content import schedule as schedule_module
@@ -355,6 +356,21 @@ async def test__unschedule__moves_back_only_a_future_puzzle(
         assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(offset))
 
 
+@pytest.mark.parametrize("offset", [0, -1], ids=["today", "yesterday"])
+async def test__unschedule__refuses_today_and_the_past_for_a_disabled_game_too(
+    db_session: AsyncSession, offset: int
+) -> None:
+    # Owner decision 72: AC-59 stays strict, whatever the game's switch says.
+    game = await create_game(db_session, is_enabled=False)
+    answer = await create_title(db_session, name="Portal")
+    puzzle = await create_puzzle(db_session, game=game, answer=answer, puzzle_date=day(offset))
+
+    with pytest.raises(UnscheduleRefusedError, match="locked"):
+        await unschedule(db_session, game, day(offset), now=clock(0))
+
+    assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(offset))
+
+
 async def test__unschedule__then_schedule_gives_the_date_to_another_puzzle(
     db_session: AsyncSession,
 ) -> None:
@@ -399,6 +415,27 @@ async def test__unschedule__refuses_a_puzzle_with_stored_games(db_session: Async
         await unschedule(db_session, game, day(3), now=clock(0))
 
     assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(3))
+
+
+async def test__schedule__reads_the_launch_date_fresh_under_the_games_row_lock(
+    db_session: AsyncSession,
+) -> None:
+    game = await create_game(db_session, launch_date=FAR_PAST_LAUNCH)
+    answer = await create_title(db_session, name="Portal")
+    puzzle = await create_puzzle(
+        db_session, game=game, answer=answer, puzzle_date=None, status=PuzzleStatus.APPROVED
+    )
+    puzzle.approved_at = APPROVED_AT
+    # Another session moved the launch date after this one loaded the game: the object is stale.
+    await db_session.execute(
+        update(Game).where(Game.id == game.id).values(launch_date=day(20)),
+        execution_options={"synchronize_session": False},
+    )
+    assert game.launch_date == FAR_PAST_LAUNCH
+
+    result = await schedule(db_session, game, lambda key: True, now=clock(0))
+
+    assert [item.date for item in result.scheduled] == [day(20)]
 
 
 async def test__schedule__the_buffer_is_counted_from_tomorrow_up_to_the_cap(

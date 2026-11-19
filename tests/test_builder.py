@@ -1460,6 +1460,9 @@ def test__s3_writer__skips_a_key_that_exists_and_puts_a_private_object(
             writer.put(key, source, "video/mp4")
         assert stored == []
         return
+    # The store's "cannot tell" is its own answer for a caller that must not act on "missing".
+    assert writer.exists_or_unknown(key) is (None if head_code == "403" else False)
+    assert writer.exists(key) is False
     # A 403 on the HEAD is "not known to exist": the object is written (the same bytes again are
     # harmless, the key is the hash of the content). The second put then finds it.
     assert (writer.put(key, source, "video/mp4"), writer.put(key, source, "video/mp4")) == (

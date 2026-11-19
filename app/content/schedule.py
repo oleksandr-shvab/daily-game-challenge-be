@@ -30,7 +30,6 @@ blocking (`MediaWriter.exists`), so it is called in `asyncio.to_thread`; an `OSE
 `MediaWriteError`, a storage error, not a database one.
 """
 
-import asyncio
 import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -40,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.readiness import Problem, puzzle_problems
 from app.core.clock import utc_today
+from app.crud.game import lock_game
 from app.crud.puzzle import (
     clear_puzzle_schedule,
     has_stored_games,
@@ -50,7 +50,7 @@ from app.crud.puzzle import (
     lock_scheduled_puzzle_on_date,
     set_puzzle_schedule,
 )
-from app.media.writer import MediaWriteError
+from app.media.writer import storage_call
 from app.models.game import Game
 from app.models.puzzle import Puzzle, PuzzleStatus
 
@@ -139,12 +139,11 @@ def _drop_repeats(pool: list[Puzzle], used_titles: set[int], repeats: list[int])
 
 
 async def readiness_problems(puzzle: Puzzle, file_exists: Callable[[str], bool]) -> list[Problem]:
-    try:
-        return await asyncio.to_thread(puzzle_problems, puzzle.clues, file_exists=file_exists)
-    except OSError as error:
-        # A folder that cannot be read is a storage error, not a database one (the caller's
-        # session wrapper would name it so).
-        raise MediaWriteError(f"the storage cannot be read: {type(error).__name__}") from error
+    # A folder that cannot be read is a storage error, not a database one (the caller's session
+    # wrapper would name it so).
+    return await storage_call(
+        "the storage cannot be read", puzzle_problems, puzzle.clues, file_exists=file_exists
+    )
 
 
 async def schedule(
@@ -155,6 +154,9 @@ async def schedule(
     now: Callable[[], dt.datetime],
     until: dt.date | None = None,
 ) -> ScheduleResult:
+    # The launch date and the enabled flag are read under a share lock on the game's row, so a
+    # change by `manage_game.py` (an exclusive lock) and this run wait for each other.
+    game = await lock_game(db, game.id, is_shared=True)
     variant = game.default_variant
     today = utc_today(now())
     # `stop_reason` stays `POOL_EMPTY` unless the walk breaks out below.

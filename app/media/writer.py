@@ -6,6 +6,7 @@ is the same bytes and `put` does nothing. Nothing is ever public: the local fold
 through signed links, and the bucket gets no ACL.
 """
 
+import asyncio
 import os
 import tempfile
 from collections.abc import Callable
@@ -16,8 +17,10 @@ from app.core.config import Settings
 from app.media.signing import is_media_key
 
 # A HEAD has no body, so a missing key comes back as "404". Some S3-compatible stores answer 403 to
-# a HEAD for a missing key when the credentials lack ListBucket, so 403 is "not known to exist" too.
-S3_NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound", "403"})
+# a HEAD for a missing key when the credentials lack ListBucket: that is "not known to exist" for
+# `exists`, and "cannot tell" for `exists_or_unknown`.
+S3_NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+S3_FORBIDDEN_CODE = "403"
 
 
 class MediaWriteError(Exception):
@@ -30,10 +33,28 @@ class MediaWriter(Protocol):
 
     def exists(self, key: str) -> bool: ...
 
+    def exists_or_unknown(self, key: str) -> bool | None:
+        """Like `exists`, but None when the store cannot tell (a bucket whose HEAD answers 403
+        for a key that may or may not be there). A caller that would act on "missing" (promote's
+        repair) uses this one, so it never re-uploads everything."""
+        ...
+
     def put(self, key: str, path: Path, content_type: str) -> bool:
         """Store the file at `path` under `key`. Returns False and writes nothing when the key is
         already there (AC-41)."""
         ...
+
+
+async def storage_call[T, **P](
+    message: str, call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """Run a blocking storage or file call in a thread. An `OSError` becomes a `MediaWriteError`
+    "<message>: <error class>", so an async caller's database session wrapper (which also catches
+    `OSError`) never takes it for a database error."""
+    try:
+        return await asyncio.to_thread(call, *args, **kwargs)
+    except OSError as error:
+        raise MediaWriteError(f"{message}: {type(error).__name__}") from error
 
 
 def write_atomically(path: Path, write: Callable[[BinaryIO], None]) -> None:
@@ -65,6 +86,9 @@ class LocalMediaWriter:
 
     def exists(self, key: str) -> bool:
         return (self.directory / _checked_key(key)).is_file()
+
+    def exists_or_unknown(self, key: str) -> bool | None:
+        return self.exists(key)
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
         if self.exists(key):
@@ -116,19 +140,26 @@ class S3MediaWriter:
             return MediaWriteError(f"the bucket refused a {action}: {code}")
         return MediaWriteError(f"the bucket cannot be reached: {type(error).__name__}")
 
-    def exists(self, key: str) -> bool:
-        """True when the bucket says the key is there. A 403 on a HEAD is "not known to exist": the
-        store may hide a missing key from credentials without ListBucket. `put` is content-addressed,
-        so writing the same bytes again is harmless."""
+    def exists_or_unknown(self, key: str) -> bool | None:
+        """True or False when the bucket says so; None on a 403 on the HEAD, which a store may
+        answer for a missing key when the credentials lack ListBucket."""
         try:
             self.client.head_object(Bucket=self.bucket, Key=_checked_key(key))
         except self._client_error as error:
-            if error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_CODES:
+            code = error.response.get("Error", {}).get("Code")
+            if code in S3_NOT_FOUND_CODES:
                 return False
+            if code == S3_FORBIDDEN_CODE:
+                return None
             raise self._write_error(error, "HEAD") from error
         except self._boto_error as error:
             raise self._write_error(error, "HEAD") from error
         return True
+
+    def exists(self, key: str) -> bool:
+        """True when the bucket says the key is there. A 403 on a HEAD is "not known to exist":
+        `put` is content-addressed, so writing the same bytes again is harmless."""
+        return bool(self.exists_or_unknown(key))
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
         if self.exists(key):

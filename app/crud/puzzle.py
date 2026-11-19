@@ -146,6 +146,34 @@ async def list_puzzle_slots(db: AsyncSession, game_id: int, variant: str) -> set
     return set(result.scalars())
 
 
+async def list_slot_answers(db: AsyncSession, game_id: int, variant: str) -> dict[int, int | None]:
+    """The build slots that have a puzzle, in any status, each with the IGDB id of its answer
+    (None for a title that did not come from IGDB). Promote matches by slot and compares answers."""
+    result = await db.execute(
+        select(Puzzle.build_slot, Title.igdb_id)
+        .join(Title, Title.id == Puzzle.answer_title_id)
+        .where(Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.build_slot.is_not(None))
+    )
+    return {slot: igdb_id for slot, igdb_id in result.all()}
+
+
+async def list_slot_media_keys(
+    db: AsyncSession, game_id: int, variant: str
+) -> dict[int, dict[str, str]]:
+    """For each build slot that has a puzzle, the media keys its rows name, each with its content
+    type. Promote repairs a slot's files from these, the target's own rows."""
+    result = await db.execute(
+        select(Puzzle.build_slot, ClueMediaFile.key, ClueMediaFile.content_type)
+        .join(PuzzleClue, PuzzleClue.puzzle_id == Puzzle.id)
+        .join(ClueMediaFile, ClueMediaFile.clue_id == PuzzleClue.id)
+        .where(Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.build_slot.is_not(None))
+    )
+    keys: dict[int, dict[str, str]] = {}
+    for slot, key, content_type in result.all():
+        keys.setdefault(slot, {})[key] = content_type
+    return keys
+
+
 @dataclass(frozen=True)
 class MediaFileInput:
     role: str
@@ -163,7 +191,7 @@ class ClueInput:
     media_type: str
     hint_kind: str | None
     hint_value: str | None
-    source_url: str
+    source_url: str | None
     source_image_ids: list[str]
     files: Sequence[MediaFileInput]
 
@@ -190,13 +218,15 @@ async def add_built_puzzle(
     game_id: int,
     variant: str,
     build_slot: int,
-    generator_version: str,
+    generator_version: str | None,
     answer_title_id: int,
     status: PuzzleStatus,
     clues: Sequence[ClueInput],
+    approved_at: dt.datetime | None = None,
 ) -> Puzzle:
     """The builder's insert: a puzzle with no date, its clues and their media rows. It flushes and
-    never commits; the caller owns the transaction, so a draft exists whole or not at all."""
+    never commits; the caller owns the transaction, so a draft exists whole or not at all. Promote
+    passes the source's `approved_at`."""
     puzzle = Puzzle(
         game_id=game_id,
         variant=variant,
@@ -204,6 +234,7 @@ async def add_built_puzzle(
         status=status,
         build_slot=build_slot,
         generator_version=generator_version,
+        approved_at=approved_at,
         answer_title_id=answer_title_id,
     )
     db.add(puzzle)
