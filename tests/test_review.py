@@ -4,17 +4,20 @@ The app is driven through httpx over its own ASGI app, with the test session as 
 session (`actions` commit, which only releases the test's savepoint)."""
 
 import datetime as dt
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.review import actions
+from app.content.review import html as review_html
 from app.content.review.app import SessionFactory, create_review_app
 from app.content.target import TargetRefusedError
 from app.crud.exclusion import add_exclusion, list_exclusions
@@ -89,6 +92,7 @@ def make_app(
     world: World,
     environ: Mapping[str, str] = LOCAL,
     session_factory: SessionFactory | None = None,
+    token: str | None = TOKEN,
 ):
     @asynccontextmanager
     async def test_session() -> AsyncIterator[AsyncSession]:
@@ -100,7 +104,7 @@ def make_app(
         port=PORT,
         environ=environ,
         clock=lambda: NOW,
-        token=TOKEN,
+        token=token,
     )
 
 
@@ -519,3 +523,464 @@ async def test__action__a_failing_rollback_does_not_hide_the_error(
             await actions.approve(world.db, puzzle_id, NOW)
         else:
             await actions.reject(world.db, puzzle_id, ExclusionReason.NEVER)
+
+
+# (d) gaps found by mutating the code (M1-24a test-writer pass). Each test below turns red when
+# the code it names is changed; the one-line reasons say how.
+
+
+class Markup(HTMLParser):
+    """The tags and text of a page as a browser reads them: attribute values are unescaped, so an
+    attribute that was not escaped shows up as extra attributes or tags."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.tags: list[tuple[str, dict[str, str | None]]] = []
+        self.text = ""
+        self.feed(text)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags.append((tag, dict(attrs)))
+
+    def handle_data(self, data: str) -> None:
+        self.text += data
+
+    def find(self, name: str) -> list[dict[str, str | None]]:
+        return [attrs for tag, attrs in self.tags if tag == name]
+
+
+@dataclass
+class Form:
+    action: str
+    hidden: dict[str, str]
+    buttons: list[tuple[str, str]]  # (name, value) of each submit button, "" when it has none
+
+
+def read_forms(text: str) -> list[Form]:
+    forms: list[Form] = []
+    for tag, attrs in Markup(text).tags:
+        if tag == "form":
+            forms.append(Form(attrs["action"] or "", {}, []))
+        elif tag == "input" and attrs.get("type") == "hidden":
+            forms[-1].hidden[attrs["name"] or ""] = attrs["value"] or ""
+        elif tag == "button":
+            forms[-1].buttons.append((attrs.get("name") or "", attrs.get("value") or ""))
+    return forms
+
+
+FORM = "application/x-www-form-urlencoded"
+PAD = "&pad="
+
+
+def sized_form(size: int) -> bytes:
+    """A form with a valid token, padded to exactly `size` bytes."""
+    head = f"token={TOKEN}{PAD}"
+    return (head + "a" * (size - len(head))).encode()
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type", "body", "status"),
+    [
+        ("approve", FORM, sized_form(2048), 303),  # the cap is 2 KiB, inclusive
+        ("approve", FORM, sized_form(2049), 413),
+        ("approve", FORM, f"token={TOKEN}&a=1&b=2&c=3".encode(), 303),  # 4 fields
+        ("approve", FORM, f"token={TOKEN}&a=1&b=2&c=3&d=4".encode(), 400),  # 5 fields
+        ("approve", FORM + "; charset=UTF-8", f"token={TOKEN}".encode(), 303),
+        ("approve", FORM.upper(), f"token={TOKEN}".encode(), 303),
+        ("approve", "text/plain", f"token={TOKEN}".encode(), 415),  # a no-preflight cross-site type
+        ("approve", None, f"token={TOKEN}".encode(), 415),
+        ("approve", FORM, f"token=wrong&token={TOKEN}".encode(), 403),  # the first value wins
+        ("approve", FORM, f"token={TOKEN}&token=wrong".encode(), 303),
+        ("reject", FORM, f"token={TOKEN}&reason=".encode() + b"\xff\xfe", 422),  # not a 500
+    ],
+    ids=[
+        "cap-exact",
+        "cap-over",
+        "four-fields",
+        "five-fields",
+        "charset-parameter",
+        "uppercase-type",
+        "text-plain",
+        "no-type",
+        "duplicate-wrong-first",
+        "duplicate-right-first",
+        "invalid-utf8",
+    ],
+)
+async def test__post__form_reader_limits_and_rules(
+    world: World,
+    page: AsyncClient,
+    path: str,
+    content_type: str | None,
+    body: bytes,
+    status: int,
+) -> None:
+    puzzle = await world.draft(7)
+    headers = {"Content-Type": content_type} if content_type else {}
+
+    response = await page.post(f"/drafts/{puzzle.id}/{path}", content=body, headers=headers)
+
+    assert response.status_code == status
+    expected = PuzzleStatus.APPROVED if status == 303 else PuzzleStatus.IN_REVIEW
+    assert await world.status_of(puzzle.id) == expected
+
+
+LOCAL_NAME = f"localhost:{PORT}"
+LOCAL_IP = f"127.0.0.1:{PORT}"
+
+
+@pytest.mark.parametrize(
+    ("headers", "get_status", "post_status"),
+    [
+        ([("Host", LOCAL_IP), ("Origin", f"http://{LOCAL_IP}")], 200, 303),
+        ([("Host", LOCAL_NAME), ("Origin", f"http://{LOCAL_IP}")], 200, 303),
+        ([("Host", LOCAL_NAME), ("Origin", f"https://{LOCAL_NAME}")], 200, 403),
+        ([("Host", f"[::1]:{PORT}"), ("Origin", ORIGIN)], 403, 403),
+        ([("Host", f"0.0.0.0:{PORT}"), ("Origin", ORIGIN)], 403, 403),
+        ([("Host", f"evil.localhost:{PORT}"), ("Origin", ORIGIN)], 403, 403),
+        ([("Host", f"{LOCAL_NAME}.evil.example"), ("Origin", ORIGIN)], 403, 403),
+        ([("Host", LOCAL_NAME), ("Host", "evil.example"), ("Origin", ORIGIN)], 403, 403),
+        ([("Host", LOCAL_NAME), ("Origin", ORIGIN), ("Origin", "http://evil.example")], 200, 403),
+    ],
+    ids=[
+        "ip-host-and-origin",
+        "name-host-ip-origin",
+        "https-origin",
+        "ipv6-host",
+        "any-address-host",
+        "localhost-subdomain-host",
+        "host-with-suffix",
+        "two-hosts-good-first",
+        "two-origins-good-first",
+    ],
+)
+async def test__host_and_origin__only_the_page_own_names_pass(
+    world: World,
+    page: AsyncClient,
+    headers: list[tuple[str, str]],
+    get_status: int,
+    post_status: int,
+) -> None:
+    puzzle = await world.draft(7)
+    page.headers.pop("Origin")
+
+    get_response = await page.get("/", headers=headers)
+    post_response = await page.post(
+        f"/drafts/{puzzle.id}/approve", data={"token": TOKEN}, headers=headers
+    )
+
+    assert (get_response.status_code, post_response.status_code) == (get_status, post_status)
+    approved = PuzzleStatus.APPROVED if post_status == 303 else PuzzleStatus.IN_REVIEW
+    assert await world.status_of(puzzle.id) == approved
+
+
+async def test__draft_page_forms__work_with_the_pages_own_token_and_buttons(
+    world: World, page: AsyncClient
+) -> None:
+    rebuilt = await world.draft(7)
+    approved = await world.draft(8, title=1)
+
+    forms = read_forms((await page.get(f"/drafts/{rebuilt.id}")).text)
+
+    assert [(f.action, f.buttons) for f in forms] == [
+        (f"/drafts/{rebuilt.id}/approve", [("", "")]),
+        (f"/drafts/{rebuilt.id}/reject", [("reason", "rebuild"), ("reason", "never")]),
+    ]
+    response = await page.post(forms[1].action, data={**forms[1].hidden, "reason": "rebuild"})
+    assert (response.status_code, response.headers["location"]) == (303, f"/drafts/{approved.id}")
+    (row,) = await list_exclusions(world.db, world.game_id)
+    assert (row.reason, row.build_slot) == (ExclusionReason.REBUILD, 7)
+    forms = read_forms((await page.get(f"/drafts/{approved.id}")).text)
+    response = await page.post(forms[0].action, data=forms[0].hidden)
+    assert response.status_code == 303
+    assert await world.status_of(approved.id) == PuzzleStatus.APPROVED
+
+
+async def test__token__is_made_per_process_and_kept_for_its_life(world: World) -> None:
+    puzzle_id = (await world.draft(7)).id
+    pages = []
+    for _ in range(2):
+        transport = ASGITransport(app=make_app(world, token=None))
+        client = AsyncClient(transport=transport, base_url=ORIGIN, headers={"Origin": ORIGIN})
+        async with client:
+            tokens = {
+                read_forms((await client.get(f"/drafts/{puzzle_id}")).text)[0].hidden["token"]
+                for _ in range(2)
+            }
+            assert len(tokens) == 1  # the same token on every page of one process
+            pages.append((tokens.pop(), transport))
+
+    (first, first_transport), (second, _) = pages
+    assert first != second
+    assert min(len(first), len(second)) >= 43  # secrets.token_urlsafe(32)
+    async with AsyncClient(
+        transport=first_transport, base_url=ORIGIN, headers={"Origin": ORIGIN}
+    ) as client:
+        wrong = await client.post(f"/drafts/{puzzle_id}/approve", data={"token": second})
+        right = await client.post(f"/drafts/{puzzle_id}/approve", data={"token": first})
+    assert (wrong.status_code, right.status_code) == (403, 303)
+
+
+async def test__queue__is_in_slot_order_with_drafts_only_and_the_next_draft_follows_it(
+    world: World, page: AsyncClient
+) -> None:
+    world.titles[0].name = f"Portal {HOSTILE}"
+    no_slot = await world.draft(None)
+    slot_9 = await world.draft(9, title=1)
+    slot_8 = await world.draft(8, title=2)
+    await world.draft(5, status=PuzzleStatus.APPROVED)  # not a draft: not listed, not counted
+
+    queue = (await page.get("/")).text
+
+    assert [int(i) for i in re.findall(r"/drafts/(\d+)", queue)] == [
+        slot_8.id,
+        slot_9.id,
+        no_slot.id,
+    ]
+    assert "Drafts in review: 3" in queue
+    assert "&lt;script&gt;" in queue
+    assert "<script" not in queue
+    assert "3 in review" in (await page.get(f"/drafts/{slot_8.id}")).text
+    approve = await page.post(f"/drafts/{slot_8.id}/approve", data={"token": TOKEN})
+    assert approve.headers["location"] == f"/drafts/{slot_9.id}"
+    reject = await page.post(
+        f"/drafts/{slot_9.id}/reject", data={"token": TOKEN, "reason": "never"}
+    )
+    assert reject.headers["location"] == f"/drafts/{no_slot.id}"
+
+
+async def test__file__is_served_only_with_a_media_row_and_the_stored_type(
+    world: World, page: AsyncClient
+) -> None:
+    puzzle = await world.draft(7)
+    clip, no_file = media_key(puzzle.id, 6, "source"), media_key(puzzle.id, 2, "source")
+    orphan = media_key(0, 0, "orphan")  # a SHA-256 in no row
+    (world.media_dir / clip).write_bytes(b"RIFFxxxxWEBP")  # looks like WebP, the row says MP4
+    (world.media_dir / orphan).write_bytes(b"left over from a rejected draft")
+
+    served = await page.get(f"/files/{clip}")
+
+    assert (served.status_code, served.headers["content-type"]) == (200, "video/mp4")
+    assert (await page.get(f"/files/{orphan}")).status_code == 404
+    assert (await page.get(f"/files/{no_file}")).status_code == 404  # a row, but no file
+
+
+def assert_security_headers(response: Response) -> None:
+    csp = dict(
+        part.strip().split(" ", 1)
+        for part in response.headers["content-security-policy"].split(";")
+    )
+    assert csp["default-src"] == "'self'"
+    assert (csp["frame-ancestors"], csp["form-action"], csp["base-uri"]) == (
+        "'none'",
+        "'self'",
+        "'none'",
+    )
+    assert "unsafe" not in response.headers["content-security-policy"]
+    for name, value in {
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+        "referrer-policy": "same-origin",
+        "cache-control": "no-store",
+    }.items():
+        assert response.headers.get_list(name) == [value]
+
+
+async def test__every_response__has_the_security_headers_and_the_page_has_no_script_or_style(
+    world: World, page: AsyncClient
+) -> None:
+    puzzle = await world.draft(7)
+    key = media_key(puzzle.id, 1, "source")
+    (world.media_dir / key).write_bytes(b"x")
+    page.headers.pop("Origin")
+
+    responses = {
+        "queue": await page.get("/"),
+        "draft": await page.get(f"/drafts/{puzzle.id}"),
+        "file": await page.get(f"/files/{key}"),
+        "stylesheet": await page.get("/review.css"),
+        "foreign host": await page.get("/", headers={"Host": "evil.example"}),
+        "no origin": await page.post(
+            f"/drafts/{puzzle.id}/approve", headers={"Content-Type": FORM}
+        ),
+        "redirect": await page.post(
+            f"/drafts/{puzzle.id}/approve",
+            data={"token": TOKEN},
+            headers={"Origin": ORIGIN},
+        ),
+    }
+
+    for name, response in responses.items():
+        try:
+            assert_security_headers(response)
+        except AssertionError as error:
+            raise AssertionError(f"{name}: {error}") from error
+    assert responses["stylesheet"].status_code == 200
+    assert responses["stylesheet"].headers["content-type"].startswith("text/css")
+    for name in ("queue", "draft"):
+        markup = Markup(responses[name].text)
+        assert {"rel": "stylesheet", "href": "/review.css"} in markup.find("link")
+        assert not markup.find("script")
+        assert not any("style" in attrs or "onclick" in attrs for _, attrs in markup.tags)
+
+
+async def test__draft_page__shows_each_clue_as_the_player_sees_it(
+    world: World, page: AsyncClient
+) -> None:
+    world.titles[0].year, world.titles[0].franchise = 2007, "Aperture"
+    puzzle = await world.draft(7)
+    other = await world.draft(8, title=1)
+    await world.db.execute(  # the second draft's step 2 has no file
+        delete(ClueMediaFile).where(
+            ClueMediaFile.key == media_key(other.id, 2, "source"),
+        )
+    )
+    await world.db.commit()
+
+    markup = Markup((await page.get(f"/drafts/{puzzle.id}")).text)
+
+    images = markup.find("img")
+    assert [i["src"] for i in images] == [
+        f"/files/{media_key(puzzle.id, step, 'source')}" for step in range(1, 6)
+    ]
+    assert {(i["width"], i["height"]) for i in images} == {("640", "360")}
+    (video,) = markup.find("video")
+    assert "muted" in video and "loop" in video and "autoplay" in video
+    assert video["poster"] == f"/files/{media_key(puzzle.id, 6, 'poster')}"
+    assert (video["width"], video["height"]) == ("640", "360")
+    (source,) = markup.find("source")
+    assert (source["src"], source["type"]) == (
+        f"/files/{media_key(puzzle.id, 6, 'source')}",
+        "video/mp4",
+    )
+    new_tab = [a for a in markup.find("a") if a.get("target") == "_blank"]
+    assert len(new_tab) == 5 + 6  # the step images, the source links
+    assert all("noopener" in (a["rel"] or "") for a in new_tab)
+    sources = [a["href"] for a in new_tab if a["rel"] == "noopener noreferrer"]
+    assert sources == [f"https://example.com/source/{i}" for i in range(1, 7)]
+    assert "2007" in markup.text and "Aperture" in markup.text
+    assert markup.text.count("no hint") == 1  # step 3
+    assert len(markup.find("input")) - 2 == 5  # the checklist, apart from the two tokens
+    other_page = Markup((await page.get(f"/drafts/{other.id}")).text)
+    assert other_page.text.count("no file") == 1
+    assert len(other_page.find("img")) == 4
+
+
+@pytest.mark.parametrize(
+    ("url", "is_link"),
+    [
+        ("http://www.igdb.com/games/portal", True),
+        ("https://www.igdb.com/games/portal?a=1&b=2", True),
+        ("ftp://example.com/x", False),
+        ("javascript:alert(1)", False),
+        ("javascript://example.com/%0aalert(1)", False),
+        ("data:text/html,<b>x</b>", False),
+        ("//evil.example/x", False),
+        ("/relative/path", False),
+        ("https:///no-host", False),
+        ("https:no-slashes", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test__link_target__is_a_plain_http_url_only(url: str | None, is_link: bool) -> None:
+    assert review_html.link_target(url) == (url if is_link else None)
+
+
+def clue_view(**fields: object) -> review_html.ClueView:
+    base: dict[str, object] = {
+        "step": 1,
+        "is_video": False,
+        "hint_kind": None,
+        "hint_value": None,
+        "source_url": None,
+        "source": review_html.FileView("k" * 64, "image/webp", 640, 360),
+        "poster": None,
+    }
+    return review_html.ClueView(**{**base, **fields})  # type: ignore[arg-type]
+
+
+def render_clue(clue: review_html.ClueView) -> Markup:
+    draft = review_html.DraftView(1, 7, "Portal", 1999, None, [clue], 1)
+    return Markup(review_html.draft_page(draft, TOKEN))
+
+
+def test__source_link__is_escaped_and_a_non_link_is_text() -> None:
+    quoted = 'https://igdb.example/x"onmouseover="alert(1)<b>'
+    markup = render_clue(clue_view(source_url=quoted))
+    (link,) = [a for a in markup.find("a") if a.get("rel") == "noopener noreferrer"]
+    assert link == {"href": quoted, "target": "_blank", "rel": "noopener noreferrer"}
+
+    markup = render_clue(clue_view(source_url="ftp://x.example/<script>alert(1)</script>"))
+    assert not markup.find("script")
+    assert "source: ftp://x.example/<script>alert(1)</script>" in markup.text
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "caption"),
+    [
+        ("critic_score", "85", "Critic score: 85"),
+        ("platform", "Switch", "Platform: Switch"),
+        ("genre", "Puzzle", "Genre: Puzzle"),
+        ("year", "2007", "Release year: 2007"),
+        ("developer", "Valve", "Developer: Valve"),
+        ("year", None, "no hint"),
+        (None, "2007", "no hint"),
+    ],
+)
+def test__hint__is_shown_with_its_label_or_as_no_hint(
+    kind: str | None, value: str | None, caption: str
+) -> None:
+    text = render_clue(clue_view(hint_kind=kind, hint_value=value)).text
+    assert caption in text
+    if caption == "no hint":
+        assert "None" not in text and "2007" not in text
+
+
+async def test__post__a_refused_action_answers_409_and_a_missing_draft_404(
+    world: World, page: AsyncClient
+) -> None:
+    approved_id = (await world.draft(7, status=PuzzleStatus.APPROVED)).id  # read once: rollbacks
+
+    for path in ("approve", "reject"):
+        form = {"token": TOKEN, "reason": "never"}
+        assert (await page.post(f"/drafts/{approved_id}/{path}", data=form)).status_code == 409
+        assert (
+            await page.post(f"/drafts/{approved_id + 999}/{path}", data=form)
+        ).status_code == 404
+
+    assert (await page.get(f"/drafts/{approved_id}")).status_code == 404  # not a draft
+    assert (await page.get(f"/drafts/{approved_id + 999}")).status_code == 404
+    assert await world.status_of(approved_id) == PuzzleStatus.APPROVED
+    assert await world.count(AnswerExclusion) == 0
+
+
+async def test__reject__image_ids_are_listed_once_in_step_order(world: World) -> None:
+    image_ids = [["c"], ["b", "c"], ["a"], ["a", "e"], ["d"], ["z", "y", "x", "z"]]
+    puzzle = await world.draft(7, image_ids=image_ids)
+
+    await actions.reject(world.db, puzzle.id, ExclusionReason.REBUILD)
+
+    (row,) = (await world.db.execute(select(AnswerExclusion))).scalars()
+    assert row.image_ids == ["c", "b", "a", "e", "d", "z", "y", "x"]
+
+
+async def test__reject_never__leaves_another_variants_rebuild_rows_alone(world: World) -> None:
+    await add_exclusion(
+        world.db,
+        game_id=world.game_id,
+        variant="other",
+        title_id=world.titles[0].id,
+        reason=ExclusionReason.REBUILD,
+        build_slot=7,
+        image_ids=["a"],
+    )
+    puzzle = await world.draft(7)  # the default variant, same slot, same title
+
+    await actions.reject(world.db, puzzle.id, ExclusionReason.NEVER)
+
+    rows = await list_exclusions(world.db, world.game_id)
+    assert sorted((r.variant, r.reason, r.build_slot) for r in rows) == [
+        ("default", ExclusionReason.NEVER, None),
+        ("other", ExclusionReason.REBUILD, 7),
+    ]
