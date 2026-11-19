@@ -14,7 +14,7 @@ from app.crud.exclusion import add_exclusion, give_up_rebuild, list_exclusions
 from app.crud.puzzle import (
     delete_puzzle,
     get_puzzle_for_update,
-    has_stored_game,
+    has_stored_games,
     list_clue_image_ids,
 )
 from app.games.enums import ExclusionReason
@@ -52,7 +52,7 @@ async def _load_for_review(db: AsyncSession, puzzle_id: int) -> Puzzle:
         raise PuzzleNotFoundError(f"no puzzle {puzzle_id}")
     if puzzle.status != PuzzleStatus.IN_REVIEW:
         raise NotInReviewError(f"puzzle {puzzle_id} is not in review")
-    if await has_stored_game(db, puzzle_id):
+    if await has_stored_games(db, puzzle_id):
         raise StoredGameError(f"puzzle {puzzle_id} has stored games and is never edited")
     return puzzle
 

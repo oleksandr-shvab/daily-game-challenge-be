@@ -397,11 +397,6 @@ async def get_puzzle_for_update(db: AsyncSession, puzzle_id: int) -> Puzzle | No
     return result.scalar_one_or_none()
 
 
-async def has_stored_game(db: AsyncSession, puzzle_id: int) -> bool:
-    """Whether any account has a game on the puzzle (AC-86)."""
-    return bool(await db.scalar(select(exists().where(Progress.puzzle_id == puzzle_id))))
-
-
 async def list_clue_image_ids(db: AsyncSession, puzzle_id: int) -> list[list[str]]:
     """The `source_image_ids` of each clue, in step order. A clue with none gives an empty list."""
     result = await db.execute(
