@@ -223,3 +223,116 @@ async def add_built_puzzle(
         for file in clue_input.files:
             await add_clue_media_file(db, clue.id, file)
     return puzzle
+
+
+# --- Scheduling (M1-24b, SPEC-04 AC-55 to AC-60, AC-86) ---
+
+_WITH_ANSWER_AND_CLUES = (
+    joinedload(Puzzle.answer_title),
+    joinedload(Puzzle.clues).joinedload(PuzzleClue.media_files),
+)
+
+
+async def list_dated_puzzles(db: AsyncSession, game_id: int, variant: str) -> list[Puzzle]:
+    """Every puzzle of the game and variant that has a date, in any status, with its answer title
+    and no clues. A scheduled one counts for the series and repeat rules, any of them occupies its
+    date (the unique key `(game_id, variant, date)`)."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.date.is_not(None))
+        .options(joinedload(Puzzle.answer_title))
+        .order_by(Puzzle.date)
+    )
+    return list(result.scalars())
+
+
+async def list_approved_puzzles(db: AsyncSession, game_id: int, variant: str) -> list[Puzzle]:
+    """The approved puzzles in the order they were approved, then by id (R-16), with the answer
+    title, clues and media files. A NULL `approved_at` (no CHECK forbids one, and a plain
+    `ORDER BY` would put it last) counts as the oldest: it goes first."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(
+            Puzzle.game_id == game_id,
+            Puzzle.variant == variant,
+            Puzzle.status == PuzzleStatus.APPROVED,
+        )
+        .options(*_WITH_ANSWER_AND_CLUES)
+        .order_by(Puzzle.approved_at.asc().nulls_first(), Puzzle.id)
+    )
+    return list(result.unique().scalars())
+
+
+async def list_dated_answers(db: AsyncSession, game_id: int) -> list[tuple[int, int]]:
+    """`(puzzle id, answer title id)` of every puzzle of the game that has a date, in every
+    variant and any status: the answers that are used, for the repeat rule. A dated puzzle that is
+    not scheduled (an old draft) counts, so its answer is never given a second date."""
+    result = await db.execute(
+        select(Puzzle.id, Puzzle.answer_title_id).where(
+            Puzzle.game_id == game_id, Puzzle.date.is_not(None)
+        )
+    )
+    return [(puzzle_id, title_id) for puzzle_id, title_id in result.all()]
+
+
+async def list_scheduled_puzzles_between(
+    db: AsyncSession, game_id: int, variant: str, start: dt.date, end: dt.date
+) -> list[Puzzle]:
+    """The scheduled puzzles dated from `start` up to but not including `end`, by date, with clues
+    and media files."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(
+            Puzzle.game_id == game_id,
+            Puzzle.variant == variant,
+            Puzzle.status == PuzzleStatus.SCHEDULED,
+            Puzzle.date >= start,
+            Puzzle.date < end,
+        )
+        .options(*_WITH_ANSWER_AND_CLUES)
+        .order_by(Puzzle.date)
+    )
+    return list(result.unique().scalars())
+
+
+async def lock_scheduled_puzzle_on_date(
+    db: AsyncSession, game_id: int, variant: str, puzzle_date: dt.date
+) -> Puzzle | None:
+    """The scheduled puzzle of the date, its row locked until the transaction ends and read fresh,
+    so the caller's checks and its write see the same row."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(
+            Puzzle.game_id == game_id,
+            Puzzle.variant == variant,
+            Puzzle.date == puzzle_date,
+            Puzzle.status == PuzzleStatus.SCHEDULED,
+        )
+        .with_for_update(of=Puzzle)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def has_stored_games(db: AsyncSession, puzzle_id: int) -> bool:
+    """True when any account has progress on the puzzle (AC-86): its answer, clues and date must
+    never change then."""
+    result = await db.execute(select(exists().where(Progress.puzzle_id == puzzle_id)))
+    return bool(result.scalar())
+
+
+async def set_puzzle_schedule(db: AsyncSession, puzzle: Puzzle, puzzle_date: dt.date) -> None:
+    """Approved to scheduled on `puzzle_date`. Flushes, never commits: the caller owns the
+    transaction."""
+    puzzle.date = puzzle_date
+    puzzle.status = PuzzleStatus.SCHEDULED
+    await db.flush()
+
+
+async def clear_puzzle_schedule(db: AsyncSession, puzzle: Puzzle, now: dt.datetime) -> None:
+    """Scheduled back to approved, with no date. `approved_at` becomes `now`: the puzzle goes to
+    the back of the queue, so the next scheduling run does not put it straight back."""
+    puzzle.date = None
+    puzzle.approved_at = now
+    puzzle.status = PuzzleStatus.APPROVED
+    await db.flush()

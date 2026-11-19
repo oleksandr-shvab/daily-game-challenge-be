@@ -71,6 +71,7 @@ from app.crud.puzzle import (
 )
 from app.crud.title import create_title, find_key_holders, get_titles_by_igdb_ids
 from app.games.enums import ClueContentType, ClueRole, ExclusionReason, MediaType
+from app.games.modules.game_guesser import clue_layout_problem
 from app.media.writer import MediaWriteError, MediaWriter, write_atomically
 from app.models.puzzle import PuzzleStatus
 from app.models.title import TitleKind
@@ -430,26 +431,24 @@ def clue_inputs(plan: SlotPlan, files: Sequence[BuiltFile]) -> list[ClueInput]:
 
 
 def layout_problem(clues: Sequence[ClueInput]) -> str | None:
-    """The media rule of SPEC-02 AC-13b for a draft about to be written: steps 1 to 5 each one WebP
-    and no poster; step 6 one MP4 and one WebP poster. `None` when it holds."""
+    """The media rule for a draft about to be written. The AC-13b part is the shared
+    `clue_layout_problem`, the same function the view, scheduling and the buffer check use. On top
+    of it a draft has the builder's own shape (AC-29): steps 1 to 5 are images, step 6 is a video,
+    the builder makes no WebM (Open point 6) and every poster is a WebP image. `None` when it holds."""
     if [clue.step for clue in clues] != list(range(1, STEPS + 1)):
         return "a draft has exactly the steps 1 to 6"
     for clue in clues:
-        sources = sorted(f.content_type for f in clue.files if f.role == ClueRole.SOURCE)
-        posters = [f for f in clue.files if f.role == ClueRole.POSTER]
-        if clue.step < STEPS:
-            is_valid = (
-                clue.media_type == MediaType.IMAGE
-                and sources == [ClueContentType.IMAGE_WEBP]
-                and not posters
+        expected_type = MediaType.IMAGE if clue.step < STEPS else MediaType.VIDEO
+        is_builder_shape = (
+            clue.media_type == expected_type
+            and all(f.content_type != ClueContentType.VIDEO_WEBM for f in clue.files)
+            and all(
+                f.content_type == ClueContentType.IMAGE_WEBP
+                for f in clue.files
+                if f.role == ClueRole.POSTER
             )
-        else:
-            is_valid = (
-                clue.media_type == MediaType.VIDEO
-                and sources == [ClueContentType.VIDEO_MP4]
-                and [f.content_type for f in posters] == [ClueContentType.IMAGE_WEBP]
-            )
-        if not is_valid:
+        )
+        if not is_builder_shape or clue_layout_problem(clue.step, clue.media_type, clue.files):
             return f"step {clue.step} breaks the media rules"
     return None
 

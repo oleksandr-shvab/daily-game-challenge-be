@@ -424,6 +424,63 @@ async def test__build__a_draft_that_breaks_the_media_rule_fails_its_slot_not_the
     assert [await count(env.db, m) for m in (Puzzle, PuzzleClue, ClueMediaFile, Title)] == [0] * 4
 
 
+def media_file(role: str, content_type: str) -> crud_puzzle.MediaFileInput:
+    return crud_puzzle.MediaFileInput(role, "0" * 64, content_type, 100, 640, 360, None)
+
+
+def draft_clues(
+    *, replace: dict[int, tuple[str, list[crud_puzzle.MediaFileInput]]] | None = None
+) -> list[crud_puzzle.ClueInput]:
+    """Six valid clues, steps 1 to 5 images and step 6 a video; `replace` swaps one step's media
+    type and files."""
+    webp = media_file("source", "image/webp")
+    clues = []
+    for step in range(1, 7):
+        media_type, files = (
+            ("image", [webp])
+            if step < 6
+            else ("video", [media_file("source", "video/mp4"), media_file("poster", "image/webp")])
+        )
+        media_type, files = (replace or {}).get(step, (media_type, files))
+        clues.append(
+            crud_puzzle.ClueInput(step, media_type, None, None, "https://example.com", [], files)
+        )
+    return clues
+
+
+@pytest.mark.parametrize(
+    ("replace", "is_valid"),
+    [
+        ({}, True),
+        # The shared AC-13b rule: an image clue has one WebP and no poster.
+        ({2: ("image", [media_file("source", "image/webp")] * 2)}, False),
+        # The builder's own shape on top of it: steps 1 to 5 images, no WebM.
+        (
+            {3: ("video", [media_file("source", "video/mp4"), media_file("poster", "image/webp")])},
+            False,
+        ),
+        (
+            {
+                6: (
+                    "video",
+                    [
+                        media_file("source", "video/mp4"),
+                        media_file("source", "video/webm"),
+                        media_file("poster", "image/webp"),
+                    ],
+                )
+            },
+            False,
+        ),
+    ],
+    ids=["valid", "two_images_in_one_clue", "video_at_step_3", "webm_at_step_6"],
+)
+def test__layout_problem__applies_the_shared_rule_and_the_builders_shape(
+    replace: dict[int, tuple[str, list[crud_puzzle.MediaFileInput]]], is_valid: bool
+) -> None:
+    assert (builder_module.layout_problem(draft_clues(replace=replace)) is None) is is_valid
+
+
 @pytest.mark.parametrize(
     ("error", "stops_the_run"),
     [
