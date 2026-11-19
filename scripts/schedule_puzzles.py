@@ -88,7 +88,7 @@ def report_lines(result: ScheduleResult, *, show_answers: bool) -> list[str]:
     if result.buffer_from_launch is not None:
         lines.append(
             f"before launch: {result.buffer_from_launch} day(s) with a ready puzzle from the"
-            f" launch date {result.first_day} (not the buffer of the check)"
+            f" launch date {result.first_day} (the check counts from the launch date)"
         )
     return lines
 
