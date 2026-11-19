@@ -32,6 +32,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
+import asyncpg
 import httpx
 from av.error import FFmpegError
 from PIL import Image
@@ -120,13 +121,15 @@ class DatabaseFailure(Exception):
 
 @contextlib.contextmanager
 def database_errors() -> Iterator[None]:
-    """Name an `SQLAlchemyError` or `OSError` raised inside the block `DatabaseFailure`. An
-    unreachable Postgres raises `ConnectionRefusedError`, an `OSError` like a file error, so what
-    is database work has to be named in one place. Storage and file work inside the block must be
-    classified before it gets here (`MediaWriteError`, a slot error), or it would be named wrongly."""
+    """Name an `SQLAlchemyError`, `OSError` or asyncpg error raised inside the block
+    `DatabaseFailure`. An unreachable Postgres raises `ConnectionRefusedError`, an `OSError` like a
+    file error, and a database or a password that is wrong raises an asyncpg error that SQLAlchemy
+    does not wrap when it comes from opening the connection, so what is database work has to be
+    named in one place. Storage and file work inside the block must be classified before it gets
+    here (`MediaWriteError`, a slot error), or it would be named wrongly."""
     try:
         yield
-    except (SQLAlchemyError, OSError) as error:
+    except (SQLAlchemyError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as error:
         raise DatabaseFailure(type(error).__name__) from error
 
 
