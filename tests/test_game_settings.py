@@ -1,9 +1,10 @@
 """The launch date and the enabled flag (SPEC-04 AC-56, AC-61, Q17), through the library and the
 script's guard. Real Postgres through `db_session`."""
 
+import contextlib
 import datetime as dt
 import importlib.util
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -12,8 +13,13 @@ import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.content.game_settings import GameSettingsError, apply_game_settings
-from app.crud.game import get_game_by_slug
+from app.content.game_settings import GameChange, GameSettingsError, apply_game_settings
+from app.crud.game import (
+    count_scheduled_puzzles_before,
+    game_has_stored_games,
+    get_game_by_slug,
+    has_scheduled_puzzle_on_or_before,
+)
 from app.crud.title import create_title
 from app.models.game import Game
 from app.models.progress import Progress
@@ -57,10 +63,12 @@ async def test__game_settings__creates_a_disabled_game_then_sets_the_date_and_th
         await apply_game_settings(
             db_session, "game-guesser", launch_date=None, is_enabled=None, now=clock(0)
         )
-    with pytest.raises(GameSettingsError, match="slug"):
-        await apply_game_settings(
-            db_session, "Bad Slug", launch_date=LAUNCH, is_enabled=None, now=clock(0)
-        )
+    # The whole slug must match, not only its start.
+    for bad_slug in ("Bad Slug", "good slug"):
+        with pytest.raises(GameSettingsError, match="slug"):
+            await apply_game_settings(
+                db_session, bad_slug, launch_date=LAUNCH, is_enabled=None, now=clock(0)
+            )
 
     created = await apply_game_settings(
         db_session, "game-guesser", launch_date=LAUNCH, is_enabled=None, now=clock(0)
@@ -84,6 +92,14 @@ async def test__game_settings__creates_a_disabled_game_then_sets_the_date_and_th
         db_session, "game-guesser", launch_date=None, is_enabled=None, now=clock(0)
     )
     assert unchanged.lines()[-1] == "nothing changed"
+
+    # A game created with the switch is enabled from the start.
+    enabled = await apply_game_settings(
+        db_session, "other-game", launch_date=LAUNCH, is_enabled=True, now=clock(0)
+    )
+    assert enabled.lines() == ["other-game: created, launch date 2027-01-15, enabled"]
+    other = await get_game_by_slug(db_session, "other-game")
+    assert other is not None and other.is_enabled
 
 
 @dataclass
@@ -114,10 +130,16 @@ class Move:
         Move(puzzle_offset=-3, has_account_game=True, is_game_enabled=False, enable_arg=False, message="stored games"),
         # ... unless the same command enables it.
         Move(puzzle_offset=-3, is_game_enabled=False, enable_arg=True, message="today or earlier"),
+        # An enabled game that is switched off by the same command was visible: the guards stay.
+        Move(puzzle_offset=-3, enable_arg=False, message="today or earlier"),
+        # No switch given: a disabled game stays disabled. A puzzle dated on the new date is not
+        # before it.
+        Move(puzzle_offset=-3, is_game_enabled=False, enable_arg=None, hidden=1),
+        Move(puzzle_offset=(LATER - TODAY).days, is_game_enabled=False, enable_arg=None, hidden=0),
         # Today moves forward between the early check and the write: the puzzle is visible now.
         Move(puzzle_offset=1, new_date=LAUNCH - dt.timedelta(days=10), clock_days=(0, 1), message="today or earlier"),
     ],
-    ids=["no_puzzle", "scheduled_after", "stored_games", "visible", "dated_today", "hidden", "disabled_counts_the_hidden", "disabled_stored_games", "disabled_but_enabling", "today_moves_forward"],
+    ids=["no_puzzle", "scheduled_after", "stored_games", "visible", "dated_today", "hidden", "disabled_counts_the_hidden", "disabled_stored_games", "disabled_but_enabling", "enabled_but_disabling", "disabled_stays_disabled", "disabled_puzzle_on_the_new_date", "today_moves_forward"],
 )  # fmt: skip
 async def test__game_settings__the_launch_date_stays_when_it_would_change_what_players_saw(
     db_session: AsyncSession, move: Move
@@ -156,7 +178,8 @@ async def test__game_settings__the_launch_date_stays_when_it_would_change_what_p
             is_enabled=move.enable_arg,
             now=clock(*move.clock_days),
         )
-        assert await state(db_session) == (move.new_date, move.enable_arg)
+        expected_enabled = move.is_game_enabled if move.enable_arg is None else move.enable_arg
+        assert await state(db_session) == (move.new_date, expected_enabled)
         assert change.hidden_scheduled == move.hidden
         assert any("--unschedule" in line for line in change.lines()) == bool(move.hidden)
         return
@@ -201,6 +224,109 @@ async def test__game_settings__reads_the_game_again_under_the_lock(
     assert await state(db_session) == (LAUNCH, False)
 
 
+def change(**fields: object) -> GameChange:
+    values: dict[str, object] = {
+        "slug": "game-guesser",
+        "is_created": False,
+        "launch_date": LAUNCH,
+        "is_enabled": True,
+        "before_launch_date": LAUNCH,
+        "before_is_enabled": True,
+    }
+    return GameChange(**{**values, **fields})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("game_change", "lines"),
+    [
+        (
+            change(is_created=True, is_enabled=False, before_launch_date=None, before_is_enabled=None),
+            ["game-guesser: created, launch date 2027-01-15, disabled"],
+        ),
+        (
+            change(launch_date=LATER, is_enabled=True, before_is_enabled=False),
+            ["game-guesser: launch date 2027-02-01 (was 2027-01-15), enabled (was disabled)", "changed"],
+        ),
+        (
+            change(launch_date=LATER, is_enabled=False, before_is_enabled=False),
+            ["game-guesser: launch date 2027-02-01 (was 2027-01-15), disabled", "changed"],
+        ),
+        (
+            change(is_enabled=False, before_is_enabled=True),
+            ["game-guesser: launch date 2027-01-15, disabled (was enabled)", "changed"],
+        ),
+        (change(), ["game-guesser: launch date 2027-01-15, enabled", "nothing changed"]),
+        (
+            change(launch_date=LATER, is_enabled=False, before_is_enabled=False, hidden_scheduled=2),
+            [
+                "game-guesser: launch date 2027-02-01 (was 2027-01-15), disabled",
+                "changed",
+                (
+                    "2 scheduled puzzle(s) are dated before the new launch date: they will not show"
+                    " and their answers stay used. Free them with schedule_puzzles.py --unschedule"
+                    " DATE (allowed while the game is disabled)."
+                ),
+            ],
+        ),
+    ],
+    ids=["created", "date_and_switch", "date_only", "switch_only", "nothing", "hidden_scheduled"],
+)  # fmt: skip
+def test__game_change__lines_say_what_changed_and_what_it_was(
+    game_change: GameChange, lines: list[str]
+) -> None:
+    assert game_change.lines() == lines
+
+
+async def test__game_queries__only_this_games_puzzles_and_progress_count(
+    db_session: AsyncSession,
+) -> None:
+    game = await create_game(db_session, launch_date=LAUNCH)
+    other = await create_game(db_session, slug="other-game", launch_date=LAUNCH)
+    title = await create_title(db_session, name="Answer")
+    own_dates = [TODAY - dt.timedelta(days=2), TODAY, TODAY + dt.timedelta(days=5)]
+    own = [
+        await create_puzzle(db_session, game=game, answer=title, puzzle_date=day)
+        for day in own_dates
+    ]
+    # Another game has a scheduled puzzle long ago, and a player with a stored game on it.
+    foreign = await create_puzzle(
+        db_session, game=other, answer=title, puzzle_date=TODAY - dt.timedelta(days=10)
+    )
+    account = User(email="player@example.com", hashed_password="not-a-real-hash")
+    db_session.add(account)
+    await db_session.flush()
+
+    def progress_on(puzzle_id: int) -> Progress:
+        return Progress(
+            user_id=account.id,
+            puzzle_id=puzzle_id,
+            status="in_progress",
+            started_at=dt.datetime(2027, 1, 15, tzinfo=dt.UTC),
+            counts_for_streak=True,
+            origin="play",
+        )
+
+    db_session.add(progress_on(foreign.id))
+    await db_session.flush()
+
+    # Dated before the day: the day itself is not before it, and the other game does not count.
+    assert (
+        await count_scheduled_puzzles_before(db_session, game.id, TODAY + dt.timedelta(days=5)) == 2
+    )
+    # Dated on or before the day: the day itself counts, the other game's puzzle does not.
+    assert await has_scheduled_puzzle_on_or_before(
+        db_session, game.id, TODAY - dt.timedelta(days=2)
+    )
+    assert not await has_scheduled_puzzle_on_or_before(
+        db_session, game.id, TODAY - dt.timedelta(days=3)
+    )
+    # Only progress on this game's puzzles is a stored game of this game.
+    assert not await game_has_stored_games(db_session, game.id)
+    db_session.add(progress_on(own[1].id))
+    await db_session.flush()
+    assert await game_has_stored_games(db_session, game.id)
+
+
 def load_script() -> ModuleType:
     path = Path(__file__).resolve().parent.parent / "scripts" / "manage_game.py"
     spec = importlib.util.spec_from_file_location("p3_manage_game", path)
@@ -236,3 +362,77 @@ def test__manage_game_script__the_guard_refuses_before_any_database_call(
 
     captured = capsys.readouterr()
     assert code == 1 and message in captured.err and captured.out == ""
+
+
+@pytest.mark.parametrize(
+    ("is_game_enabled", "argv", "lines", "commits", "final"),
+    [
+        (False, [], ["game-guesser: launch date 2027-01-15, disabled"], 0, (LAUNCH, False)),
+        (True, [], ["game-guesser: launch date 2027-01-15, enabled"], 0, (LAUNCH, True)),
+        (
+            False,
+            ["--enable"],
+            ["game-guesser: launch date 2027-01-15, enabled (was disabled)", "changed"],
+            1,
+            (LAUNCH, True),
+        ),
+        (
+            True,
+            ["--disable"],
+            ["game-guesser: launch date 2027-01-15, disabled (was enabled)", "changed"],
+            1,
+            (LAUNCH, False),
+        ),
+        (
+            False,
+            ["--launch-date", "2027-02-01"],
+            ["game-guesser: launch date 2027-02-01 (was 2027-01-15), disabled", "changed"],
+            1,
+            (LATER, False),
+        ),
+    ],
+    ids=["shows_a_disabled_game", "shows_an_enabled_game", "enable", "disable", "launch_date"],
+)  # fmt: skip
+async def test__manage_game_script__with_no_option_it_prints_the_settings_and_changes_nothing(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    is_game_enabled: bool,
+    argv: list[str],
+    lines: list[str],
+    commits: int,
+    final: tuple[dt.date, bool],
+) -> None:
+    await create_game(db_session, launch_date=LAUNCH, is_enabled=is_game_enabled)
+    script = load_script()
+    committed: list[None] = []
+    real_commit = db_session.commit
+
+    async def counting_commit() -> None:
+        committed.append(None)
+        await real_commit()
+
+    @contextlib.asynccontextmanager
+    async def session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    monkeypatch.setattr(db_session, "commit", counting_commit)
+    monkeypatch.setattr(script, "database_session", session)
+
+    result = await script.run(script.build_parser().parse_args(argv))
+
+    assert (result, len(committed), await state(db_session)) == (lines, commits, final)
+
+
+async def test__manage_game_script__with_no_option_and_no_game_it_says_a_launch_date_is_needed(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = load_script()
+
+    @contextlib.asynccontextmanager
+    async def session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    monkeypatch.setattr(script, "database_session", session)
+
+    with pytest.raises(GameSettingsError, match="--launch-date"):
+        await script.run(script.build_parser().parse_args([]))

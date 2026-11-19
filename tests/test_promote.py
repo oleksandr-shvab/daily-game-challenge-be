@@ -22,11 +22,13 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from app.content import promote as promote_module
+from app.content.builder import UnknownGameError
 from app.content.media import measure
 from app.content.promote import (
     PromoteRefusedError,
     PromoteReport,
     PromoteStatus,
+    PuzzleOutcome,
     SourceDatabaseFailure,
     promote,
     read_source,
@@ -53,6 +55,8 @@ SEED_MEDIA = BACKEND_ROOT / "scripts" / "seed_media"
 APPROVED_AT = dt.datetime(2026, 11, 1, 12, 0, tzinfo=dt.UTC)
 SOURCE_URL = settings.TEST_DATABASE_URL + "_src"
 SOURCE_ANSWER = "Source Answer Name"
+# Not the builder's own version: a copy must carry the source's.
+SOURCE_GENERATOR_VERSION = "source-0"
 # A WebP header with nothing behind it: Pillow raises a plain `OSError` for it.
 JUNK_WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 junk-junk-junk"
 JUNK_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20
@@ -100,6 +104,7 @@ class CountingWriter:
         self.inner = LocalMediaWriter(directory)
         self.directory = directory
         self.puts: list[str] = []
+        self.content_types: dict[str, str] = {}
         # A bucket whose HEAD answers 403: it cannot say what it has.
         self.cannot_tell = False
 
@@ -111,6 +116,7 @@ class CountingWriter:
 
     def put(self, key: str, path: Path, content_type: str) -> bool:
         self.puts.append(key)
+        self.content_types[key] = content_type
         return self.inner.put(key, path, content_type)
 
 
@@ -143,7 +149,7 @@ class World:
             None,
         )
 
-    async def add_source_puzzle(self, slot: int, igdb_id: int, name: str) -> None:
+    async def add_source_puzzle(self, slot: int, igdb_id: int | None, name: str) -> None:
         """Steps 1 to 4 and 6 use the seed files; step 5 is the puzzle's own file."""
         title = await create_title(self.source_db, name=name, igdb_id=igdb_id)
         own = self.own_file(name)
@@ -165,7 +171,7 @@ class World:
             game_id=self.source_game.id,
             variant="default",
             build_slot=slot,
-            generator_version="1",
+            generator_version=SOURCE_GENERATOR_VERSION,
             answer_title_id=title.id,
             status=PuzzleStatus.APPROVED,
             clues=clues,
@@ -271,7 +277,7 @@ async def test__promote__copies_an_approved_puzzle_whole_and_a_second_run_adds_n
         PuzzleStatus.APPROVED,
         None,
         APPROVED_AT,
-        "1",
+        SOURCE_GENERATOR_VERSION,
     )
     assert puzzle.answer_title_id == title_id
     # Rows are the source's, step by step, file by file; every file is in the target's folder.
@@ -280,6 +286,8 @@ async def test__promote__copies_an_approved_puzzle_whole_and_a_second_run_adds_n
     every_file = world.files_of(SOURCE_ANSWER)
     assert all(world.writer.exists(file.key) for file in every_file)
     assert sorted(world.writer.puts) == sorted(file.key for file in every_file)
+    # Each file goes up with the content type of its row (a bucket stores it with the object).
+    assert world.writer.content_types == {file.key: file.content_type for file in every_file}
     # An existing title is never changed (the target's name stays).
     names = (await world.target_db.execute(select(Title.name))).scalars().all()
     assert names == ["Target Name Stays"]
@@ -299,11 +307,13 @@ async def test__promote__copies_an_approved_puzzle_whole_and_a_second_run_adds_n
     rows_before = await media_rows(world.target_db)
     for file in every_file:
         (world.writer.directory / file.key).unlink()
+    world.writer.content_types.clear()
     repaired = await world.run()
 
     assert [(o.status, o.repaired) for o in repaired.outcomes] == [(PromoteStatus.ALREADY, 7)]
     assert "7 file(s) put back" in "\n".join(repaired.lines(show_answers=False))
     assert all(world.writer.exists(file.key) for file in every_file)
+    assert world.writer.content_types == {file.key: file.content_type for file in every_file}
     assert await media_rows(world.target_db) == rows_before
     assert (await world.count(Puzzle), await world.count(ClueMediaFile)) == (1, 7)
 
@@ -387,6 +397,23 @@ async def make_file_undecodable_but_hash_matches(world: World, junk: bytes = JUN
     )
 
 
+async def make_file_over_the_limits(world: World) -> None:
+    # A real WebP that is wider than the limit, with its own key and a row that says exactly what
+    # it is: every check but the limits passes.
+    await world.add_target_title(10, "Wanted")
+    old_key = world.own[SOURCE_ANSWER].key
+    path = world.source_dir / "wide"
+    Image.new("RGB", (2000, 100), (9, 9, 9)).save(path, "WEBP")
+    key = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.rename(world.source_dir / key)
+    facts = measure(world.source_dir / key)
+    await world.source_db.execute(
+        update(ClueMediaFile)
+        .where(ClueMediaFile.key == old_key)
+        .values(key=key, byte_size=facts.byte_size, width=facts.width, height=facts.height)
+    )
+
+
 async def make_file_junk_mp4(world: World) -> None:
     # An MP4 header with nothing behind it: PyAV raises a `ValueError` subclass, a content error.
     await make_file_undecodable_but_hash_matches(world, junk=JUNK_MP4)
@@ -402,6 +429,7 @@ async def make_file_junk_mp4(world: World) -> None:
         (make_file_undecodable_and_hash_mismatch, "bad_file (at step 5)", 41),
         (make_file_undecodable_but_hash_matches, "bad_file (at step 5)", 41),
         (make_file_junk_mp4, "bad_file (at step 5)", 41),
+        (make_file_over_the_limits, "bad_file (at step 5)", 41),
         (None, "title_missing_in_target (run the title import on the target first)", 41),
     ],
     ids=[
@@ -412,6 +440,7 @@ async def make_file_junk_mp4(world: World) -> None:
         "undecodable_hash_mismatch",
         "undecodable_hash_matches",
         "junk_mp4",
+        "over_the_limits",
         "title_missing",
     ],
 )
@@ -449,6 +478,158 @@ async def test__promote__refuses_the_puzzle_touches_nothing_and_goes_on_with_the
         )
     ).all()
     assert other_after == other_before
+
+
+# (b3) What cannot be keyed or would repeat an answer; a game or variant the target lacks ---------------
+
+
+async def test__promote__refuses_a_puzzle_with_no_slot_or_no_igdb_id_or_a_repeated_answer(
+    world: World,
+) -> None:
+    # A puzzle with no slot is listed last, whatever its position in the table.
+    await world.add_source_puzzle(40, 12, "No Slot")
+    await world.add_source_puzzle(41, 10, "Fine")
+    await world.add_source_puzzle(42, None, "No Id")
+    await world.add_source_puzzle(43, 13, "Fine Again")
+    await world.source_db.execute(
+        update(Puzzle).where(Puzzle.build_slot == 40).values(build_slot=None)
+    )
+    # Slot 43 has the answer of slot 41 (one title, two puzzles).
+    fine_id = (
+        await world.source_db.execute(select(Title.id).where(Title.igdb_id == 10))
+    ).scalar_one()
+    await world.source_db.execute(
+        update(Puzzle).where(Puzzle.build_slot == 43).values(answer_title_id=fine_id)
+    )
+    await world.add_target_title(10, "Fine")
+    await world.add_target_title(12, "No Slot")
+
+    report = await world.run()
+
+    assert [(o.build_slot, o.status, o.detail) for o in report.outcomes] == [
+        (41, PromoteStatus.PROMOTED, ""),
+        (42, PromoteStatus.REFUSED, "answer_has_no_igdb_id"),
+        # The answer 41 just put in the target is used from now on, in another slot too.
+        (43, PromoteStatus.REFUSED, "answer_already_in_target"),
+        (None, PromoteStatus.REFUSED, "no_build_slot"),
+    ]
+    assert await world.count(Puzzle) == 1
+
+
+async def test__promote__a_puzzle_with_no_approval_time_or_generator_version_is_copied_with_none(
+    world: World,
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    await world.add_target_title(10, "Wanted")
+    await world.source_db.execute(update(Puzzle).values(approved_at=None, generator_version=None))
+
+    report = await world.run()
+
+    assert [o.status for o in report.outcomes] == [PromoteStatus.PROMOTED]
+    puzzle = (await world.target_db.execute(select(Puzzle))).scalar_one()
+    assert (puzzle.approved_at, puzzle.generator_version) == (None, None)
+
+
+async def test__promote__a_file_two_puzzles_share_is_checked_against_each_puzzles_own_row(
+    world: World,
+) -> None:
+    await world.add_source_puzzle(41, 10, "First")
+    await world.add_source_puzzle(42, 11, "Second")
+    await world.add_target_title(10, "First")
+    await world.add_target_title(11, "Second")
+    # The step-1 file is shared; the second puzzle's row for it says a size the file does not have.
+    second_step_1 = (
+        select(ClueMediaFile.id)
+        .join(PuzzleClue, PuzzleClue.id == ClueMediaFile.clue_id)
+        .join(Puzzle, Puzzle.id == PuzzleClue.puzzle_id)
+        .where(Puzzle.build_slot == 42, PuzzleClue.step == 1)
+    )
+    await world.source_db.execute(
+        update(ClueMediaFile)
+        .where(ClueMediaFile.id.in_(second_step_1))
+        .values(byte_size=ClueMediaFile.byte_size + 1)
+    )
+
+    report = await world.run()
+
+    assert [(o.build_slot, o.status, o.detail) for o in report.outcomes] == [
+        (41, PromoteStatus.PROMOTED, ""),
+        (42, PromoteStatus.REFUSED, "bad_file (at step 1)"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("target_slug", "target_variant", "error", "message"),
+    [
+        ("missing-game", "default", UnknownGameError, "manage_game.py"),
+        ("game-guesser", "other", PromoteRefusedError, "default variant"),
+    ],
+    ids=["no_such_game", "other_variant"],
+)
+async def test__promote__stops_when_the_target_lacks_the_game_or_has_another_variant(
+    world: World, target_slug: str, target_variant: str, error: type[Exception], message: str
+) -> None:
+    await world.add_source_puzzle(41, 10, SOURCE_ANSWER)
+    await world.add_target_title(10, "Wanted")
+    await world.target_db.execute(update(Game).values(default_variant=target_variant))
+    await world.target_db.commit()
+    source = await read_source(world.source_db, "game-guesser")
+
+    with pytest.raises(error, match=message):
+        await promote(
+            world.target_db,
+            source,
+            slug=target_slug,
+            source_dir=world.source_dir,
+            writer=world.writer,
+        )
+
+    assert (await world.count(Puzzle), world.writer.puts) == (0, [])
+
+
+def test__promote_report__lines_name_each_outcome_and_the_totals_add_up() -> None:
+    report = PromoteReport(
+        [
+            PuzzleOutcome(41, PromoteStatus.PROMOTED, answer_name="Alpha"),
+            PuzzleOutcome(42, PromoteStatus.ALREADY, answer_name="Beta", repaired=4, lost=5),
+            PuzzleOutcome(43, PromoteStatus.ALREADY, repaired=2, is_unchecked=True),
+            PuzzleOutcome(44, PromoteStatus.REFUSED, "bad_file (at step 5)", "Delta"),
+            PuzzleOutcome(45, PromoteStatus.REFUSED, "answer_already_in_target"),
+            PuzzleOutcome(None, PromoteStatus.REFUSED, "no_build_slot"),
+        ]
+    )
+
+    assert report.lines(show_answers=False) == [
+        "promoted slot 41",
+        (
+            "already in the target, rows left alone: slot 42; 4 file(s) put back"
+            "; 5 file(s) lost, not in the source"
+        ),
+        (
+            "already in the target, rows left alone: slot 43; 2 file(s) put back"
+            "; this bucket does not let us check, repair skipped"
+        ),
+        "refused slot 44: bad_file (at step 5)",
+        "refused slot 45: answer_already_in_target",
+        "refused no slot: no_build_slot",
+        (
+            "promoted 1, already in the target 2, refused 3, files put back 6,"
+            " files lost and not in the source 5"
+        ),
+    ]
+    assert report.lines(show_answers=True)[0] == "promoted slot 41 (Alpha)"
+    assert report.lines(show_answers=True)[3] == "refused slot 44 (Delta): bad_file (at step 5)"
+
+
+def test__local_media_writer__says_yes_or_no_and_is_never_unknown(tmp_path: Path) -> None:
+    writer = LocalMediaWriter(tmp_path)
+    key = hashlib.sha256(b"x").hexdigest()
+
+    assert writer.exists_or_unknown(key) is False
+
+    (tmp_path / key).write_bytes(b"x")
+
+    assert writer.exists_or_unknown(key) is True
 
 
 # (c) Files go first; a failing write rolls the rows back ---------------------------------------
@@ -736,6 +917,7 @@ class Setup:
     kind: str = "local"
     source_url: str = "postgresql+asyncpg://postgres:x@localhost:1/none"
     target_url: str = "postgresql+asyncpg://postgres:x@localhost:2/none"
+    has_source_dir: bool = True
 
 
 @pytest.mark.parametrize(
@@ -749,8 +931,15 @@ class Setup:
         (Setup(cleared_by="x", target_url="postgresql+asyncpg://u:y@localhost:1/none"), PromoteRefusedError),
         (Setup(cleared_by="x", target_url="postgresql+asyncpg://u:y@127.0.0.1:1/none"), PromoteRefusedError),
         (Setup(cleared_by="x", source_url="postgresql+asyncpg://u@db.example.com/none"), PromoteRefusedError),
+        (Setup(cleared_by="x", source_url="postgresql://u:y@localhost:1/none"), PromoteRefusedError),
+        (Setup(cleared_by="x", source_url="nonsense :y@"), PromoteRefusedError),
+        (Setup(cleared_by="x", has_source_dir=False), PromoteRefusedError),
+        # Another database on the same server is not the target.
+        (Setup(cleared_by="x", source_url=settings.TEST_DATABASE_URL + "_missing", target_url=settings.TEST_DATABASE_URL), SourceDatabaseFailure),
+        # No port is the default port, whichever way this machine is spelled.
+        (Setup(cleared_by="x", source_url="postgresql+asyncpg://u:y@localhost/none", target_url="postgresql+asyncpg://u:y@127.0.0.1:5432/none"), PromoteRefusedError),
     ],
-    ids=["gate_closed", "gate_closed_for_a_bucket", "gate_open", "local_needs_no_gate", "no_such_database", "same_database", "same_database_other_spelling", "remote_source"],
+    ids=["gate_closed", "gate_closed_for_a_bucket", "gate_open", "local_needs_no_gate", "no_such_database", "same_database", "same_database_other_spelling", "remote_source", "other_driver", "unreadable_url", "source_dir_is_not_a_folder", "same_server_other_database", "same_database_default_port"],
 )  # fmt: skip
 async def test__run_promote__the_gate_and_the_setup_come_before_the_source_is_read(
     tmp_path: Path, setup: Setup, error: type[Exception]
@@ -763,7 +952,7 @@ async def test__run_promote__the_gate_and_the_setup_come_before_the_source_is_re
         await run_promote(
             slug="game-guesser",
             source_url=setup.source_url,
-            source_dir=tmp_path,
+            source_dir=tmp_path if setup.has_source_dir else tmp_path / "missing",
             target_name=setup.target,
             target_url=setup.target_url,
             cleared_by=setup.cleared_by,
@@ -835,3 +1024,32 @@ def test__promote_script__guard_and_gate_refuse_with_exit_1(
     # A relative folder is read from the repo root, whatever the working directory is.
     assert (str(BACKEND_ROOT / "var/p3_24c_relative") in captured.out) == has_target_line
     assert "secret" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "folder",
+    ["var/p3_24c_relative", "../p3_24c_outside_the_repo", "ABSOLUTE"],
+    ids=["inside_the_repo", "outside_the_repo", "absolute"],
+)
+def test__promote_script__a_relative_media_folder_is_read_from_the_repo_root_wherever_it_points(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    folder: str,
+) -> None:
+    for name in ("CI", "IGDB_IMAGES_CLEARED_BY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    given = str(tmp_path) if folder == "ABSOLUTE" else folder
+    argv = ["--target", "staging", "--confirm-target", "staging"]
+    source = ["--source-database-url", "postgresql+asyncpg://u:secret@localhost:1/x"]
+    monkeypatch.setattr(
+        "sys.argv", ["promote_puzzles.py", *argv, *source, "--source-media-dir", given]
+    )
+
+    code = load_script().main()
+
+    # The gate is closed, so the run stops after printing where it would have read from.
+    captured = capsys.readouterr()
+    assert code == 1 and "IGDB_IMAGES_CLEARED_BY" in captured.err
+    assert f"folder {BACKEND_ROOT / given}\n" in captured.out
