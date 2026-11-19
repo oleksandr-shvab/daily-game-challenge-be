@@ -1,4 +1,6 @@
-"""A game's launch date and its enabled flag (SPEC-04 AC-56, AC-61, Q17; owner decision 70).
+"""A game's launch date and its enabled flag (SPEC-04 AC-56, AC-61, Q17). The guards on moving the
+launch date protect AC-86 (stored games) and AC-62 (visibility); the rule for a disabled game is
+owner decision 72.
 
 `scripts/manage_game.py` is the command. The owner sets the production launch date with it before
 Phase 5: scheduling starts from the later of tomorrow and that date (AC-56), and the view number
@@ -43,7 +45,7 @@ class GameSettingsError(Exception):
 class GameChange:
     """What `apply_game_settings` did. `before_*` are None for a game it created.
     `hidden_scheduled` is the number of scheduled puzzles dated before the new launch date of a
-    disabled game: they will not show, and their answers stay used."""
+    disabled game: they stay scheduled and hidden, and their answers stay used (decision 72)."""
 
     slug: str
     is_created: bool
@@ -76,8 +78,8 @@ class GameChange:
         if self.hidden_scheduled:
             lines.append(
                 f"{self.hidden_scheduled} scheduled puzzle(s) are dated before the new launch date:"
-                " they will not show and their answers stay used. Free them with"
-                " schedule_puzzles.py --unschedule DATE (allowed while the game is disabled)."
+                " they stay scheduled and hidden, and their answers stay used (AC-59: no tool"
+                " unschedules a puzzle of today or the past, even for a disabled game)."
             )
         return lines
 

@@ -170,7 +170,15 @@ class PromoteReport:
 
     @property
     def is_ok(self) -> bool:
-        return all(outcome.status != PromoteStatus.REFUSED for outcome in self.outcomes)
+        """False (exit code 1) when a puzzle was refused, or when a file the target lost cannot
+        be put back because the source has no file with that key (decision 72)."""
+        return self.lost_files == 0 and all(
+            outcome.status != PromoteStatus.REFUSED for outcome in self.outcomes
+        )
+
+    @property
+    def lost_files(self) -> int:
+        return sum(outcome.lost for outcome in self.outcomes)
 
     def count(self, status: PromoteStatus) -> int:
         return sum(outcome.status == status for outcome in self.outcomes)
@@ -182,8 +190,12 @@ class PromoteReport:
             f" already in the target {self.count(PromoteStatus.ALREADY)},"
             f" refused {self.count(PromoteStatus.REFUSED)},"
             f" files put back {sum(outcome.repaired for outcome in self.outcomes)},"
-            f" files lost and not in the source {sum(outcome.lost for outcome in self.outcomes)}"
+            f" files lost and not in the source {self.lost_files}"
         )
+        if self.lost_files:
+            lines.append(
+                "the run fails (exit 1): the target lacks files that the source no longer has"
+            )
         return lines
 
 

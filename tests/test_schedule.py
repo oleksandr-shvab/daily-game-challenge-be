@@ -323,36 +323,20 @@ async def test__schedule__fills_free_days_by_the_rules(db_session: AsyncSession,
 
 
 @pytest.mark.parametrize(
-    ("offset", "days_on_the_clock", "is_allowed", "is_enabled"),
+    ("offset", "days_on_the_clock", "is_allowed"),
     [
-        (1, (0,), True, True),
-        (0, (0,), False, True),
-        (-1, (0,), False, True),
+        (1, (0,), True),
+        (0, (0,), False),
+        (-1, (0,), False),
         # Midnight passes between the first check and the write: the puzzle is today's now.
-        (1, (0, 1), False, True),
-        # A disabled game shows nothing, so its puzzles of any date can be moved back.
-        (0, (0,), True, False),
-        (-1, (0,), True, False),
-        (1, (0, 1), True, False),
+        (1, (0, 1), False),
     ],
-    ids=[
-        "tomorrow",
-        "today",
-        "yesterday",
-        "midnight_passes_while_it_runs",
-        "disabled_today",
-        "disabled_yesterday",
-        "disabled_midnight_passes",
-    ],
+    ids=["tomorrow", "today", "yesterday", "midnight_passes_while_it_runs"],
 )
-async def test__unschedule__moves_back_only_a_future_puzzle_of_an_enabled_game(
-    db_session: AsyncSession,
-    offset: int,
-    days_on_the_clock: tuple[int, ...],
-    is_allowed: bool,
-    is_enabled: bool,
+async def test__unschedule__moves_back_only_a_future_puzzle(
+    db_session: AsyncSession, offset: int, days_on_the_clock: tuple[int, ...], is_allowed: bool
 ) -> None:
-    game = await create_game(db_session, is_enabled=is_enabled)
+    game = await create_game(db_session)
     answer = await create_title(db_session, name="Portal")
     puzzle = await create_puzzle(db_session, game=game, answer=answer, puzzle_date=day(offset))
     puzzle.approved_at = APPROVED_AT
@@ -370,6 +354,21 @@ async def test__unschedule__moves_back_only_a_future_puzzle_of_an_enabled_game(
         with pytest.raises(UnscheduleRefusedError, match="locked"):
             await unschedule(db_session, game, day(offset), now=now)
         assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(offset))
+
+
+@pytest.mark.parametrize("offset", [0, -1], ids=["today", "yesterday"])
+async def test__unschedule__refuses_today_and_the_past_for_a_disabled_game_too(
+    db_session: AsyncSession, offset: int
+) -> None:
+    # Owner decision 72: AC-59 stays strict, whatever the game's switch says.
+    game = await create_game(db_session, is_enabled=False)
+    answer = await create_title(db_session, name="Portal")
+    puzzle = await create_puzzle(db_session, game=game, answer=answer, puzzle_date=day(offset))
+
+    with pytest.raises(UnscheduleRefusedError, match="locked"):
+        await unschedule(db_session, game, day(offset), now=clock(0))
+
+    assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(offset))
 
 
 async def test__unschedule__then_schedule_gives_the_date_to_another_puzzle(
@@ -393,15 +392,10 @@ async def test__unschedule__then_schedule_gives_the_date_to_another_puzzle(
     ]
 
 
-@pytest.mark.parametrize(
-    ("offset", "is_enabled"), [(3, True), (0, False)], ids=["enabled_future", "disabled_today"]
-)
-async def test__unschedule__refuses_a_puzzle_with_stored_games(
-    db_session: AsyncSession, offset: int, is_enabled: bool
-) -> None:
-    game = await create_game(db_session, is_enabled=is_enabled)
+async def test__unschedule__refuses_a_puzzle_with_stored_games(db_session: AsyncSession) -> None:
+    game = await create_game(db_session)
     answer = await create_title(db_session, name="Portal")
-    puzzle = await create_puzzle(db_session, game=game, answer=answer, puzzle_date=day(offset))
+    puzzle = await create_puzzle(db_session, game=game, answer=answer, puzzle_date=day(3))
     account = User(email="player@example.com", hashed_password="not-a-real-hash")
     db_session.add(account)
     await db_session.flush()
@@ -418,9 +412,9 @@ async def test__unschedule__refuses_a_puzzle_with_stored_games(
     await db_session.flush()
 
     with pytest.raises(UnscheduleRefusedError, match="stored games"):
-        await unschedule(db_session, game, day(offset), now=clock(0))
+        await unschedule(db_session, game, day(3), now=clock(0))
 
-    assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(offset))
+    assert (puzzle.status, puzzle.date) == (PuzzleStatus.SCHEDULED, day(3))
 
 
 async def test__schedule__reads_the_launch_date_fresh_under_the_games_row_lock(

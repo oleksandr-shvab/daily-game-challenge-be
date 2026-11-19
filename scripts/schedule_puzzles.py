@@ -15,8 +15,7 @@ used (scheduled in any variant, or on an old dated row) is never scheduled and i
 and past dates are never touched (AC-59).
 
 `--unschedule DATE` moves the scheduled puzzle of that date back to `approved` and frees the date.
-It refuses today and past dates, unless the game is disabled (nothing shows then, so a launch date
-that moves later can free the puzzles before it), and a puzzle with stored games (AC-59, AC-86). The puzzle goes
+It refuses today and past dates and a puzzle with stored games (AC-59, AC-86). The puzzle goes
 last in the approval queue, so the next scheduling run does not give it the same date again.
 
 `--target` is required, must equal the ENVIRONMENT variable, is printed before anything else, and a

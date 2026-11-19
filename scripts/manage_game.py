@@ -11,7 +11,8 @@ video games, disabled unless `--enable`) and then needs `--launch-date`. With no
 command only prints the game's settings. The launch date does not move once any account has stored
 games, or (for a game that is or will be enabled) a scheduled puzzle is visible (dated today or
 earlier) or dated before the new date. A game that is disabled and stays so can move; the command
-then says how many scheduled puzzles fall before the new date and how to free them.
+then says how many scheduled puzzles fall before the new date: they stay scheduled and hidden and
+their answers stay used, because no tool unschedules a puzzle of today or the past (decision 72).
 
 `--target` is required, must equal the ENVIRONMENT variable, is printed before anything else, and
 a target other than `local` also needs `--confirm-target <name>`. Nothing runs in CI (AC-44).

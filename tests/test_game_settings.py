@@ -181,7 +181,11 @@ async def test__game_settings__the_launch_date_stays_when_it_would_change_what_p
         expected_enabled = move.is_game_enabled if move.enable_arg is None else move.enable_arg
         assert await state(db_session) == (move.new_date, expected_enabled)
         assert change.hidden_scheduled == move.hidden
-        assert any("--unschedule" in line for line in change.lines()) == bool(move.hidden)
+        # The puzzles before the new date are only reported: nothing suggests freeing them.
+        assert not any("--unschedule" in line for line in change.lines())
+        assert any("stay scheduled and hidden" in line for line in change.lines()) == bool(
+            move.hidden
+        )
         return
     with pytest.raises(GameSettingsError, match=move.message):
         await apply_game_settings(
@@ -262,9 +266,9 @@ def change(**fields: object) -> GameChange:
                 "game-guesser: launch date 2027-02-01 (was 2027-01-15), disabled",
                 "changed",
                 (
-                    "2 scheduled puzzle(s) are dated before the new launch date: they will not show"
-                    " and their answers stay used. Free them with schedule_puzzles.py --unschedule"
-                    " DATE (allowed while the game is disabled)."
+                    "2 scheduled puzzle(s) are dated before the new launch date: they stay"
+                    " scheduled and hidden, and their answers stay used (AC-59: no tool"
+                    " unschedules a puzzle of today or the past, even for a disabled game)."
                 ),
             ],
         ),

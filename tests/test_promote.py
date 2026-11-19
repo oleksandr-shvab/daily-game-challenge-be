@@ -616,6 +616,7 @@ def test__promote_report__lines_name_each_outcome_and_the_totals_add_up() -> Non
             "promoted 1, already in the target 2, refused 3, files put back 6,"
             " files lost and not in the source 5"
         ),
+        "the run fails (exit 1): the target lacks files that the source no longer has",
     ]
     assert report.lines(show_answers=True)[0] == "promoted slot 41 (Alpha)"
     assert report.lines(show_answers=True)[3] == "refused slot 44 (Delta): bad_file (at step 5)"
@@ -742,7 +743,9 @@ async def test__promote__an_already_promoted_slot_is_never_refused_and_repairs_o
         lost,
         is_unchecked,
     )
-    assert report.is_ok
+    # Refusing nothing, but a file the target lost and the source cannot give back fails the run.
+    assert report.is_ok == (lost == 0)
+    assert ("the run fails (exit 1)" in "\n".join(report.lines(show_answers=False))) == bool(lost)
     assert await media_rows(world.target_db) == rows_before
     # Only the file the target's own row names is put back, and only from a source file with that
     # key: not the rebuilt source's new file, not a file whose bytes are not its key.
@@ -1053,3 +1056,41 @@ def test__promote_script__a_relative_media_folder_is_read_from_the_repo_root_whe
     captured = capsys.readouterr()
     assert code == 1 and "IGDB_IMAGES_CLEARED_BY" in captured.err
     assert f"folder {BACKEND_ROOT / given}\n" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("lost", "code"), [(1, 1), (0, 0)], ids=["lost_not_in_source", "nothing_lost"]
+)
+def test__promote_script__a_target_file_the_source_no_longer_has_makes_the_run_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    lost: int,
+    code: int,
+) -> None:
+    for name in ("CI", "ENVIRONMENT", "IGDB_IMAGES_CLEARED_BY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "promote_puzzles.py",
+            "--target",
+            "local",
+            "--source-database-url",
+            "postgresql+asyncpg://u@localhost:1/x",
+            "--source-media-dir",
+            str(tmp_path),
+        ],
+    )
+    script = load_script()
+
+    async def run_that_finds_a_lost_file(*, report: PromoteReport, **kwargs: Any) -> None:
+        report.outcomes.append(PuzzleOutcome(41, PromoteStatus.ALREADY, lost=lost))
+
+    monkeypatch.setattr(script, "run_promote", run_that_finds_a_lost_file)
+
+    assert script.main() == code
+
+    out = capsys.readouterr().out
+    assert ("the run fails (exit 1)" in out) == bool(lost)
