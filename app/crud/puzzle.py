@@ -295,6 +295,20 @@ async def list_scheduled_puzzles_between(
     return list(result.unique().scalars())
 
 
+async def get_puzzle_on_date(
+    db: AsyncSession, game_id: int, variant: str, puzzle_date: dt.date
+) -> Puzzle | None:
+    """The puzzle of the game and variant dated `puzzle_date` in any status, with clues and media
+    files (no answer), or None. The unique key `(game_id, variant, date)` allows at most one. The
+    buffer check tells a missing puzzle from one in the wrong status with it."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(Puzzle.game_id == game_id, Puzzle.variant == variant, Puzzle.date == puzzle_date)
+        .options(joinedload(Puzzle.clues).joinedload(PuzzleClue.media_files))
+    )
+    return result.unique().scalar_one_or_none()
+
+
 async def lock_scheduled_puzzle_on_date(
     db: AsyncSession, game_id: int, variant: str, puzzle_date: dt.date
 ) -> Puzzle | None:
