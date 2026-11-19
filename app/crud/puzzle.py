@@ -336,3 +336,88 @@ async def clear_puzzle_schedule(db: AsyncSession, puzzle: Puzzle, now: dt.dateti
     puzzle.approved_at = now
     puzzle.status = PuzzleStatus.APPROVED
     await db.flush()
+
+
+# ---- The review page (M1-24a). Kept in one block, apart from the builder's functions above. ----
+
+
+async def list_in_review_puzzles(db: AsyncSession) -> list[Puzzle]:
+    """The drafts waiting for the reviewer, lowest build slot first (a puzzle with no slot last),
+    with the answer title only."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(Puzzle.status == PuzzleStatus.IN_REVIEW)
+        .order_by(Puzzle.build_slot.asc().nulls_last(), Puzzle.id)
+        .options(joinedload(Puzzle.answer_title))
+    )
+    return list(result.scalars())
+
+
+async def count_in_review(db: AsyncSession) -> int:
+    return (
+        await db.scalar(
+            select(func.count()).select_from(Puzzle).where(Puzzle.status == PuzzleStatus.IN_REVIEW)
+        )
+        or 0
+    )
+
+
+async def first_in_review_id(db: AsyncSession) -> int | None:
+    """The next draft to review, in the order of `list_in_review_puzzles`."""
+    return await db.scalar(
+        select(Puzzle.id)
+        .where(Puzzle.status == PuzzleStatus.IN_REVIEW)
+        .order_by(Puzzle.build_slot.asc().nulls_last(), Puzzle.id)
+        .limit(1)
+    )
+
+
+async def get_puzzle_with_clues(db: AsyncSession, puzzle_id: int) -> Puzzle | None:
+    """The puzzle with its answer, clues and media rows, for showing it to the reviewer."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(Puzzle.id == puzzle_id)
+        .options(
+            joinedload(Puzzle.answer_title),
+            joinedload(Puzzle.clues).joinedload(PuzzleClue.media_files),
+        )
+    )
+    return result.unique().scalar_one_or_none()
+
+
+async def get_puzzle_for_update(db: AsyncSession, puzzle_id: int) -> Puzzle | None:
+    """The puzzle row alone, locked until the transaction ends, so two reviewers' clicks (or a
+    click and a player's first guess) run one after the other."""
+    result = await db.execute(
+        select(Puzzle)
+        .where(Puzzle.id == puzzle_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_clue_image_ids(db: AsyncSession, puzzle_id: int) -> list[list[str]]:
+    """The `source_image_ids` of each clue, in step order. A clue with none gives an empty list."""
+    result = await db.execute(
+        select(PuzzleClue.source_image_ids)
+        .where(PuzzleClue.puzzle_id == puzzle_id)
+        .order_by(PuzzleClue.step)
+    )
+    return [list(ids or []) for ids in result.scalars()]
+
+
+async def delete_puzzle(db: AsyncSession, puzzle: Puzzle) -> None:
+    """Deletes the puzzle; its clues and their media rows go with it (`ON DELETE CASCADE`). It
+    flushes and never commits."""
+    await db.delete(puzzle)
+    await db.flush()
+
+
+async def get_media_file_by_key(db: AsyncSession, key: str) -> ClueMediaFile | None:
+    """Any media row with this key, whatever the puzzle's status (the key is not unique, but the
+    bytes are the same, so the first by id is stable)."""
+    result = await db.execute(
+        select(ClueMediaFile).where(ClueMediaFile.key == key).order_by(ClueMediaFile.id).limit(1)
+    )
+    return result.scalar_one_or_none()

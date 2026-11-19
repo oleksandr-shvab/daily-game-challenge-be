@@ -88,3 +88,30 @@ async def give_up_rebuild(db: AsyncSession, *, game_id: int, variant: str, slot:
         )
     await db.flush()
     return len(rows)
+
+
+# ---- The review page (M1-24a). Kept in one block, apart from the builder's functions above. ----
+
+
+async def add_exclusion(
+    db: AsyncSession,
+    *,
+    game_id: int,
+    variant: str,
+    title_id: int,
+    reason: ExclusionReason,
+    build_slot: int | None,
+    image_ids: list[str],
+) -> AnswerExclusion:
+    """The reviewer's record of a rejected draft. It flushes and never commits."""
+    exclusion = AnswerExclusion(
+        game_id=game_id,
+        variant=variant,
+        title_id=title_id,
+        reason=reason,
+        build_slot=build_slot,
+        image_ids=image_ids,
+    )
+    db.add(exclusion)
+    await db.flush()
+    return exclusion
