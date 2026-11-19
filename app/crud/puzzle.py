@@ -353,6 +353,25 @@ async def list_in_review_puzzles(db: AsyncSession) -> list[Puzzle]:
     return list(result.scalars())
 
 
+async def count_in_review(db: AsyncSession) -> int:
+    return (
+        await db.scalar(
+            select(func.count()).select_from(Puzzle).where(Puzzle.status == PuzzleStatus.IN_REVIEW)
+        )
+        or 0
+    )
+
+
+async def first_in_review_id(db: AsyncSession) -> int | None:
+    """The next draft to review, in the order of `list_in_review_puzzles`."""
+    return await db.scalar(
+        select(Puzzle.id)
+        .where(Puzzle.status == PuzzleStatus.IN_REVIEW)
+        .order_by(Puzzle.build_slot.asc().nulls_last(), Puzzle.id)
+        .limit(1)
+    )
+
+
 async def get_puzzle_with_clues(db: AsyncSession, puzzle_id: int) -> Puzzle | None:
     """The puzzle with its answer, clues and media rows, for showing it to the reviewer."""
     result = await db.execute(

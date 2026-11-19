@@ -188,9 +188,9 @@ def draft_page(draft: DraftView, token: str) -> str:
     )
     base = f"/drafts/{esc(draft.puzzle_id)}"
     hidden = f'<input type="hidden" name="token" value="{esc(token)}">'
-    slot = esc(draft.build_slot) if draft.build_slot is not None else "none"
+    slot = str(draft.build_slot) if draft.build_slot is not None else "none"
     body = (
-        f"<header><h1>Slot {slot}</h1>"
+        f"<header><h1>Slot {esc(slot)}</h1>"
         f'<a href="/">{esc(draft.queue_size)} in review</a></header>'
         f'<div class="layout"><div class="grid">{figures}</div><aside>'
         f'<section><h2>Answer</h2><div class="answer">{esc(draft.answer_name)}</div>'
@@ -206,7 +206,7 @@ def draft_page(draft: DraftView, token: str) -> str:
         '<button class="never" type="submit" name="reason" value="never">Never</button>'
         "</div></form></section></aside></div>"
     )
-    return page(f"Slot {draft.build_slot}", body)
+    return page(f"Slot {slot}", body)
 
 
 def message_page(message: str) -> str:

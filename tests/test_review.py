@@ -15,9 +15,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.review import actions
-from app.content.review.app import create_review_app
+from app.content.review.app import SessionFactory, create_review_app
 from app.content.target import TargetRefusedError
-from app.crud.exclusion import list_exclusions
+from app.crud.exclusion import add_exclusion, list_exclusions
 from app.games.enums import ExclusionReason
 from app.models.exclusion import AnswerExclusion
 from app.models.game import Game
@@ -85,13 +85,17 @@ async def world(db_session: AsyncSession, tmp_path: Path) -> World:
     return World(db_session, game, titles, tmp_path, game.id)
 
 
-def make_app(world: World, environ: Mapping[str, str] = LOCAL):
+def make_app(
+    world: World,
+    environ: Mapping[str, str] = LOCAL,
+    session_factory: SessionFactory | None = None,
+):
     @asynccontextmanager
-    async def session_factory() -> AsyncIterator[AsyncSession]:
+    async def test_session() -> AsyncIterator[AsyncSession]:
         yield world.db
 
     return create_review_app(
-        session_factory=session_factory,
+        session_factory=session_factory or test_session,
         media_dir=world.media_dir,
         port=PORT,
         environ=environ,
@@ -124,7 +128,16 @@ async def test__draft_page__shows_six_clues_the_answer_and_escapes_igdb_text(
     world.titles[0].name = f"Portal {HOSTILE}"
     world.titles[0].franchise = '"><img src=x onerror=alert(2)>'
     puzzle = await world.draft(7)
-    clue = (await world.db.execute(select(PuzzleClue).where(PuzzleClue.step == 2))).scalars().one()
+    no_slot = await world.draft(None, title=1)
+    clue = (
+        (
+            await world.db.execute(
+                select(PuzzleClue).where(PuzzleClue.puzzle_id == puzzle.id, PuzzleClue.step == 2)
+            )
+        )
+        .scalars()
+        .one()
+    )
     clue.hint_kind, clue.hint_value = "developer", f"{HOSTILE} & Co"
     clue.source_url = "javascript:alert(3)"
     await world.db.commit()
@@ -134,6 +147,9 @@ async def test__draft_page__shows_six_clues_the_answer_and_escapes_igdb_text(
     body = response.text
     assert response.status_code == 200
     assert body.count("<figure>") == 6
+    assert "<title>Slot 7</title>" in body
+    assert "2 in review" in body
+    assert "<title>Slot none</title>" in (await page.get(f"/drafts/{no_slot.id}")).text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body  # the answer is shown, escaped
     assert "Developer: &lt;script&gt;" in body
     assert "<script" not in body
@@ -213,20 +229,51 @@ async def test__reject__records_variant_slot_and_every_image_id_in_step_order(
     assert await world.count(Puzzle) == 0
 
 
-async def test__reject_never__deletes_only_its_slots_rebuild_rows(world: World) -> None:
+@pytest.mark.parametrize("has_earlier_never", [False, True])
+async def test__reject_never__turns_its_slots_rebuild_rows_into_one_never_row(
+    world: World, has_earlier_never: bool
+) -> None:
     first = await world.draft(7)
     await actions.reject(world.db, first.id, ExclusionReason.REBUILD)
     other = await world.draft(8, title=1)
     await actions.reject(world.db, other.id, ExclusionReason.REBUILD)
+    if has_earlier_never:
+        await add_exclusion(
+            world.db,
+            game_id=world.game_id,
+            variant="default",
+            title_id=world.titles[0].id,
+            reason=ExclusionReason.NEVER,
+            build_slot=None,
+            image_ids=[],
+        )
     rebuilt = await world.draft(7)  # the rebuilt draft of slot 7, same answer
     await actions.reject(world.db, rebuilt.id, ExclusionReason.NEVER)
 
     rows = await list_exclusions(world.db, world.game_id)
 
-    assert [(r.title_id, r.reason, r.build_slot) for r in rows] == [
-        (world.titles[1].id, ExclusionReason.REBUILD, 8),
-        (world.titles[0].id, ExclusionReason.NEVER, None),
-    ]
+    # Slot 8's row stays; slot 7's became the title's only `never` row.
+    assert sorted((r.title_id, r.reason, r.build_slot) for r in rows) == sorted(
+        [
+            (world.titles[1].id, ExclusionReason.REBUILD, 8),
+            (world.titles[0].id, ExclusionReason.NEVER, None),
+        ]
+    )
+
+
+async def test__reject_never__refuses_when_the_slots_rebuild_rows_name_another_title(
+    world: World,
+) -> None:
+    earlier = await world.draft(7, title=1)
+    await actions.reject(world.db, earlier.id, ExclusionReason.REBUILD)
+    puzzle_id = (await world.draft(7, title=0)).id  # not what the builder would make
+
+    with pytest.raises(actions.RebuildRowsMismatchError):
+        await actions.reject(world.db, puzzle_id, ExclusionReason.NEVER)
+
+    assert await world.status_of(puzzle_id) == PuzzleStatus.IN_REVIEW
+    rows = await list_exclusions(world.db, world.game_id)
+    assert [(r.reason, r.build_slot) for r in rows] == [(ExclusionReason.REBUILD, 7)]
 
 
 async def test__reject__is_one_transaction(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,3 +443,79 @@ async def test__app__refuses_to_start_outside_local(
 ) -> None:
     with pytest.raises(TargetRefusedError):
         make_app(world, environ)
+
+
+def post_origin_header(policy: str, *, is_same_origin: bool = True) -> str:
+    """The `Origin` a browser sends on a form POST of an http page to an http URL, by the Fetch
+    standard ("append a request `Origin` header"): `no-referrer` makes it `null`, `same-origin`
+    makes it `null` only across origins, every other policy sends the origin."""
+    if policy == "no-referrer" or (policy == "same-origin" and not is_same_origin):
+        return "null"
+    return ORIGIN
+
+
+async def test__page_referrer_policy__keeps_the_origin_on_its_own_form_posts(
+    world: World, page: AsyncClient
+) -> None:
+    puzzle = await world.draft(7)
+    assert post_origin_header("no-referrer") == "null"  # the rule the helper encodes
+
+    for path in ("/", f"/drafts/{puzzle.id}"):
+        policy = (await page.get(path)).headers["referrer-policy"]
+        # A list of policies: the browser uses the last one it knows.
+        assert post_origin_header(policy.split(",")[-1].strip()) == ORIGIN
+
+    policy = (await page.get(f"/drafts/{puzzle.id}")).headers["referrer-policy"]
+    origin = post_origin_header(policy)
+    response = await page.post(
+        f"/drafts/{puzzle.id}/approve", data={"token": TOKEN}, headers={"Origin": origin}
+    )
+    assert response.status_code == 303
+
+
+@pytest.mark.parametrize("puzzle_id", [0, 2_147_483_648, 10**30])
+async def test__puzzle_id__outside_the_key_range_is_404(page: AsyncClient, puzzle_id: int) -> None:
+    assert (await page.get(f"/drafts/{puzzle_id}")).status_code == 404
+    response = await page.post(f"/drafts/{puzzle_id}/approve", data={"token": TOKEN})
+    assert response.status_code == 404
+
+
+async def test__unhandled_error__answers_500_with_the_security_headers(world: World) -> None:
+    @asynccontextmanager
+    async def broken_session() -> AsyncIterator[AsyncSession]:
+        raise RuntimeError("the database is down")
+        yield  # pragma: no cover
+
+    transport = ASGITransport(
+        app=make_app(world, session_factory=broken_session), raise_app_exceptions=False
+    )
+    async with AsyncClient(transport=transport, base_url=ORIGIN) as client:
+        response = await client.get("/")
+
+    assert response.status_code == 500
+    assert "database" not in response.text
+    assert "default-src 'self'" in response.headers["content-security-policy"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+async def test__action__a_failing_rollback_does_not_hide_the_error(
+    world: World, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    puzzle_id = (await world.draft(7)).id
+
+    async def failing(*args: object) -> None:
+        raise RuntimeError("the commit failed")
+
+    async def failing_rollback() -> None:
+        raise ConnectionError("the connection is gone")
+
+    monkeypatch.setattr(world.db, "commit", failing)
+    monkeypatch.setattr(world.db, "rollback", failing_rollback)
+    with pytest.raises(RuntimeError, match="the commit failed"):
+        if action == "approve":
+            await actions.approve(world.db, puzzle_id, NOW)
+        else:
+            await actions.reject(world.db, puzzle_id, ExclusionReason.NEVER)

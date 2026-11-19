@@ -115,19 +115,3 @@ async def add_exclusion(
     db.add(exclusion)
     await db.flush()
     return exclusion
-
-
-async def delete_rebuild_rows(db: AsyncSession, *, game_id: int, variant: str, slot: int) -> int:
-    """Deletes the slot's `rebuild` rows, for a slot whose title the reviewer has now rejected as
-    `never`: the title is out for good and the slot is free. Returns how many went. It flushes and
-    never commits."""
-    result = await db.execute(
-        delete(AnswerExclusion).where(
-            AnswerExclusion.game_id == game_id,
-            AnswerExclusion.variant == variant,
-            AnswerExclusion.build_slot == slot,
-            AnswerExclusion.reason == ExclusionReason.REBUILD,
-        )
-    )
-    await db.flush()
-    return int(result.rowcount)

@@ -9,8 +9,8 @@ requests only from itself:
 - every unsafe request (POST) needs an `Origin` that is the page's own, and a form `token` that was
   made when the process started (any web page in the owner's browser could POST to a local port).
 
-The response has no script and a strict `Content-Security-Policy`. Every text from IGDB goes
-through `html.esc`.
+Every response, a 500 included, has a strict `Content-Security-Policy` (no script), `nosniff`,
+`X-Frame-Options` and `no-store`. Every text from IGDB goes through `html.esc`.
 """
 
 import datetime as dt
@@ -40,7 +40,13 @@ from app.content.review.actions import ReviewError
 from app.content.target import LOCAL_TARGET, check_target
 from app.core.clock import get_now
 from app.core.config import Settings
-from app.crud.puzzle import get_media_file_by_key, get_puzzle_with_clues, list_in_review_puzzles
+from app.crud.puzzle import (
+    count_in_review,
+    first_in_review_id,
+    get_media_file_by_key,
+    get_puzzle_with_clues,
+    list_in_review_puzzles,
+)
 from app.games.enums import ClueRole, ExclusionReason, MediaType
 from app.media.signing import is_media_key
 from app.models.puzzle import ClueMediaFile, Puzzle, PuzzleStatus
@@ -61,10 +67,20 @@ SECURITY_HEADERS = {
     "Content-Security-Policy": CONTENT_SECURITY_POLICY,
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
+    # Not `no-referrer`: with it a browser sends `Origin: null` on the page's own form POSTs, which
+    # the middleware refuses. `same-origin` keeps the real Origin for those and sends no referrer
+    # anywhere else.
+    "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+MAX_PUZZLE_ID = 2_147_483_647  # the largest integer key: a bigger id would be a database error
+
+
+def is_puzzle_id(value: int) -> bool:
+    return 1 <= value <= MAX_PUZZLE_ID
 
 
 def allowed_hosts(port: int) -> frozenset[str]:
@@ -215,8 +231,8 @@ def create_review_app(
         return HTMLResponse(content, status_code=status_code)
 
     async def next_location(db: AsyncSession) -> str:
-        queue = await list_in_review_puzzles(db)
-        return f"/drafts/{queue[0].id}" if queue else "/"
+        next_id = await first_in_review_id(db)
+        return f"/drafts/{next_id}" if next_id is not None else "/"
 
     async def queue(request: Request) -> Response:
         async with session_factory() as db:
@@ -226,11 +242,13 @@ def create_review_app(
 
     async def draft(request: Request) -> Response:
         puzzle_id = request.path_params["puzzle_id"]
+        if not is_puzzle_id(puzzle_id):
+            return page_response(html.message_page("This draft is not in review"), 404)
         async with session_factory() as db:
             puzzle = await get_puzzle_with_clues(db, puzzle_id)
             if puzzle is None or puzzle.status != PuzzleStatus.IN_REVIEW:
                 return page_response(html.message_page("This draft is not in review"), 404)
-            queue_size = len(await list_in_review_puzzles(db))
+            queue_size = await count_in_review(db)
             view = _draft_view(puzzle, queue_size)
         return page_response(html.draft_page(view, form_token))
 
@@ -255,8 +273,11 @@ def create_review_app(
             form = await read_form(request)
             if not is_token_valid(form, form_token):
                 raise FormError(403, "the form token is missing or wrong")
+            puzzle_id = request.path_params["puzzle_id"]
+            if not is_puzzle_id(puzzle_id):
+                raise actions.PuzzleNotFoundError(f"no puzzle {puzzle_id}")
             async with session_factory() as db:
-                await run(db, request.path_params["puzzle_id"], form)
+                await run(db, puzzle_id, form)
                 location = await next_location(db)
         except FormError as error:
             return PlainTextResponse(f"Refused: {error.message}", status_code=error.status_code)
@@ -284,7 +305,13 @@ def create_review_app(
     async def stylesheet_route(request: Request) -> Response:
         return Response(html.STYLESHEET, media_type="text/css")
 
+    async def server_error(request: Request, error: Exception) -> Response:
+        """An unhandled error. Starlette's error middleware sits outside `LocalOnlyMiddleware`, so
+        this answer carries the security headers itself. It says nothing about the cause."""
+        return PlainTextResponse("Internal Server Error", status_code=500, headers=SECURITY_HEADERS)
+
     return Starlette(
+        exception_handlers={Exception: server_error},
         routes=[
             Route("/", queue),
             Route("/review.css", stylesheet_route),
