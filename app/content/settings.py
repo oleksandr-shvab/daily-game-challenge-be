@@ -43,7 +43,8 @@ class ContentSettings(BaseSettings):
     # Who may be an answer (AC-21, AC-22): the start values, for the owner to tune after measuring
     # them with `scripts/build_puzzles.py --counts` (AC-24).
     # At least 1 rating: the title import keeps games with one, and the search list must hold every
-    # candidate (R-20). Fewer than 5 screenshots is raised to 5 by the funnel (a build needs 5, decision 74).
+    # candidate (R-20). Fewer than 5 screenshots is raised to 5 by the funnel (a build needs 5,
+    # decision 74).
     CANDIDATE_MIN_RATINGS: int = Field(50, ge=1, le=10_000_000)
     CANDIDATE_MIN_SCREENSHOTS: int = Field(5, ge=1, le=100)
     CANDIDATE_MIN_WIDTH: int = Field(1280, ge=1, le=10_000)
