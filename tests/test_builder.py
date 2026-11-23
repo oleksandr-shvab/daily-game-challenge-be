@@ -11,7 +11,7 @@ import random
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
 from io import BytesIO
@@ -19,6 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import av
 import httpx
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -51,6 +52,7 @@ from app.content.fetch import ForbiddenHostError, ResponseTooLargeError
 from app.content.igdb import MAX_RETRIES, IgdbError, IgdbGame, parse_game
 from app.content.seed import TEST_SALT, Purpose, SaltError, SlotSeed
 from app.content.settings import ContentSettings
+from app.content.steam import FallbackReason, Trailer, TrailerMarker
 from app.content.target import TargetRefusedError
 from app.core.config import settings as app_settings
 from app.crud import puzzle as crud_puzzle
@@ -64,6 +66,7 @@ from app.models.puzzle import ClueMediaFile, Puzzle, PuzzleClue, PuzzleStatus
 from app.models.title import Title
 from app.models.user import User
 from tests.factories import create_game, create_puzzle
+from tests.steam_fakes import FakeSteam, new_client
 
 NOW = dt.datetime(2026, 11, 16, 12, 0, tzinfo=dt.UTC)
 LONG_AGO = int(dt.datetime(2015, 1, 1, tzinfo=dt.UTC).timestamp())
@@ -182,6 +185,7 @@ class Env:
         target: str = "local",
         settings: ContentSettings | None = None,
         writer: Any = None,
+        trailers: Any = None,
     ) -> Builder:
         return Builder(
             self.db,
@@ -194,6 +198,7 @@ class Env:
             fetch_image=self.images,
             writer=writer if writer is not None else LocalMediaWriter(self.storage),
             dry_run=dry_run,
+            trailers=trailers,
         )
 
 
@@ -1172,12 +1177,145 @@ async def test__build__stores_the_seeds_choices_with_every_screenshot_at_its_own
     # Each file is made from the screenshot its clue names: make them again from the raw cache.
     raw = env.settings.content_work_path / "raw"
     again = [tmp_path / f"step{step}.webp" for step in range(1, 6)]
-    media.pixelated_crop(raw / plan.crop.image_id, again[0], seed.stream(Purpose.CROP))
-    for path, shot in zip(again[1:], plan.steps, strict=True):
-        media.still(raw / shot.image_id, path)
+    placements = media.cut_placements(seed.stream(Purpose.CROP))
+    sources = [plan.crop, *plan.steps]
+    for step, (path, shot) in enumerate(zip(again, sources, strict=True), start=1):
+        if step < 5:
+            media.cut(raw / shot.image_id, path, step, placements[step - 1])
+        else:
+            media.still(raw / shot.image_id, path)
     assert [(await files_of(env.db, clue))[0].key for clue in clues[:5]] == [
         hashlib.sha256(path.read_bytes()).hexdigest() for path in again
     ]
+
+
+STEAM_100 = [{"uid": "100", "external_game_source": 1}]
+
+
+async def test__build__steps_1_to_5_grow_and_step_6_is_cut_from_the_steam_trailer(env: Env) -> None:
+    fake = FakeSteam({100: [1, 2]})
+    game = make_game(1, external_games=STEAM_100)
+    async with new_client(fake) as steam:
+        report = await env.builder(FakeIgdb([game]), trailers=steam).run(
+            SlotRequest(slots=range(1, 2))
+        )
+
+    outcome = report.outcomes[0]
+    assert outcome.status == SlotStatus.BUILT
+    assert outcome.clip is not None and outcome.clip.kind == "trailer" and outcome.clip.marker
+    assert "  step 6 clip: Steam trailer" in report.lines()
+    assert "clips: trailer 1; slideshows because: nothing" in report.lines()
+    clues = await clues_of(env.db, await puzzle_in_slot(env.db, 1))
+    marker = TrailerMarker.parse(clues[5].source_image_ids[0])
+    assert marker == outcome.clip.marker and marker.app_id == 100 and 9 <= marker.start <= 39
+    # The slideshow's screenshots were set aside but never fetched: five fetches, not seven.
+    assert len(env.images.asked) == 5 and len(clues[5].source_image_ids) >= 3
+    # The fake screenshots are 320x180: each cut is its fraction of that, the fifth is whole.
+    sizes = [(f.width, f.height) for c in clues[:5] for f in await files_of(env.db, c)]
+    assert sizes == [(80, 45), (112, 63), (160, 90), (224, 126), (320, 180)]
+    stored = await files_of(env.db, clues[5])
+    assert [(f.role, f.content_type) for f in stored] == [
+        ("source", "video/mp4"),
+        ("poster", "image/webp"),
+    ]
+    assert (stored[0].width, stored[0].height, stored[0].duration_ms) == (160, 90, 12_000)
+    with av.open(str(env.storage / stored[0].key)) as container:  # one video stream, no sound
+        assert len(container.streams) == 1 and container.streams.video
+
+
+def garbage_trailer(env: Env, monkeypatch: pytest.MonkeyPatch) -> Any:
+    class Source:
+        async def find(self, app_ids: Any, **_: Any) -> Trailer:
+            return Trailer(TrailerMarker(100, 1, 9), b"this is not a video", 0.0)
+
+    return Source()
+
+
+def over_limit_trailer(env: Env, monkeypatch: pytest.MonkeyPatch) -> Any:
+    def too_big(*args: Any, **kwargs: Any) -> None:
+        raise media.MediaLimitError("does not fit")
+
+    monkeypatch.setattr(media, "trailer_clip", too_big)
+    return garbage_trailer(env, monkeypatch)
+
+
+def steam_down(env: Env, monkeypatch: pytest.MonkeyPatch) -> Any:
+    fake = FakeSteam({100: [1]})
+    fake.answers["appdetails"] = 503
+    return new_client(fake)
+
+
+def no_steam_client(env: Env, monkeypatch: pytest.MonkeyPatch) -> Any:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("source", "games", "reason"),
+    [
+        (no_steam_client, STEAM_100, FallbackReason.STEAM_OFF),
+        (lambda env, mp: new_client(FakeSteam({})), [], FallbackReason.NO_STEAM_ID),
+        (lambda env, mp: new_client(FakeSteam({})), STEAM_100, FallbackReason.NO_TRAILER),
+        (steam_down, STEAM_100, FallbackReason.STEAM_UNAVAILABLE),
+        (garbage_trailer, STEAM_100, FallbackReason.UNREADABLE),
+        (over_limit_trailer, STEAM_100, FallbackReason.OVER_LIMIT),
+    ],
+    ids=["off", "no-steam-id", "no-trailer", "steam-down", "unreadable", "over-limit"],
+)
+async def test__build__no_usable_trailer_makes_the_slideshow_and_the_report_says_why(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    source: Callable[[Env, pytest.MonkeyPatch], Any],
+    games: list[dict[str, Any]],
+    reason: FallbackReason,
+) -> None:
+    pool = [make_game(1, external_games=games), make_game(2, external_games=games)]
+    trailers = source(env, monkeypatch)
+
+    report = await env.builder(FakeIgdb(pool), trailers=trailers).run(
+        SlotRequest(slots=range(1, 3))
+    )
+
+    # Two slots, both built: not having a trailer, or Steam being down, fails no slot and no run.
+    assert [o.status for o in report.outcomes] == [SlotStatus.BUILT] * 2 and report.is_ok
+    assert [o.clip.kind for o in report.outcomes if o.clip] == ["slideshow"] * 2
+    assert report.fallbacks == {reason: 2}
+    lines = report.lines()
+    assert f"  step 6 clip: slideshow ({reason})" in lines
+    assert f"clips: slideshow 2; slideshows because: {reason} 2" in lines
+    assert ("Steam was unavailable for 2 slot(s): their clips are slideshows" in lines) == (
+        reason == FallbackReason.STEAM_UNAVAILABLE
+    )
+    for number in (1, 2):
+        clues = await clues_of(env.db, await puzzle_in_slot(env.db, number))
+        assert not any(i.startswith("steam:") for i in clues[5].source_image_ids)
+        assert 2 <= len(clues[5].source_image_ids) <= 3
+        stored = await files_of(env.db, clues[5])
+        assert [f.content_type for f in stored] == ["video/mp4", "image/webp"]
+        if reason == FallbackReason.STEAM_UNAVAILABLE:  # one outage ends the asking for the run
+            assert trailers.is_unavailable
+
+
+async def test__rebuild__of_a_trailer_draft_takes_another_segment_and_other_screenshots(
+    env: Env,
+) -> None:
+    fake = FakeSteam({100: [1]})
+    game = make_game(1, screenshots=12, external_games=STEAM_100)
+    igdb = FakeIgdb([game])
+    async with new_client(fake) as steam:
+        await env.builder(igdb, trailers=steam).run(SlotRequest(slots=range(1, 2)))
+        first = (await clues_of(env.db, await puzzle_in_slot(env.db, 1)))[5].source_image_ids
+        first_ids = await reject_as_rebuild(env.db, 1)
+        assert first[0] in first_ids  # the marker is in the rejected draft's row
+
+        report = await env.builder(igdb, trailers=steam).run(SlotRequest(rebuilds=True))
+
+    assert report.outcomes[0].status == SlotStatus.BUILT and report.outcomes[0].is_rebuild
+    clues = await clues_of(env.db, await puzzle_in_slot(env.db, 1))
+    before, after = TrailerMarker.parse(first[0]), TrailerMarker.parse(clues[5].source_image_ids[0])
+    assert before and after and (after.app_id, after.movie_id) == (before.app_id, before.movie_id)
+    assert abs(after.start - before.start) >= media.CLIP_SECONDS  # a clip of other seconds
+    still_ids = {c.source_image_ids[0] for c in clues[:5]}
+    assert not still_ids & set(first_ids)  # and other screenshots (decision 71)
 
 
 async def test__dry_run__previews_the_real_run_and_leaves_its_screenshots_for_it(env: Env) -> None:

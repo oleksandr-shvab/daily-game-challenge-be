@@ -70,8 +70,13 @@ FIELDS = (
     "release_dates.date,release_dates.platform.name,genres.name,"
     "involved_companies.developer,involved_companies.company.name,"
     "aggregated_rating,aggregated_rating_count,total_rating_count,"
-    "screenshots.image_id,screenshots.width,screenshots.height"
+    "screenshots.image_id,screenshots.width,screenshots.height,"
+    "external_games.uid,external_games.external_game_source"
 )
+# `external_game_source` is a reference: unexpanded it comes back as the source's id. 1 is Steam.
+STEAM_SOURCE_ID = 1
+# A Steam app id is a 32-bit number; the id goes into a URL and into a stored marker.
+STEAM_APP_ID = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 
 
 class IgdbError(Exception):
@@ -130,6 +135,7 @@ class DropReason(StrEnum):
     PLATFORM_INVALID = "platform_invalid"
     INVOLVED_COMPANY_INVALID = "involved_company_invalid"
     COMPANY_INVALID = "company_invalid"
+    EXTERNAL_GAME_INVALID = "external_game_invalid"
 
 
 # Strict: a number sent as text, or text sent as a number, is a wrong shape, not a coercion.
@@ -218,6 +224,13 @@ class IgdbScreenshot(_Record):
     height: Annotated[int, Field(gt=0)]
 
 
+class IgdbExternalGame(_Record):
+    """A link to the game on another store. Only the Steam one is read, and only for its app id."""
+
+    uid: str
+    external_game_source: int | None = None
+
+
 class IgdbGame(_Record):
     # The record's own fields stay strict: a bad one skips the record (`parse_game`). Everything
     # nested is lenient.
@@ -251,6 +264,22 @@ class IgdbGame(_Record):
     screenshots: Annotated[
         list[IgdbScreenshot], _lenient_list(IgdbScreenshot, DropReason.SCREENSHOT_INVALID)
     ] = []
+    external_games: Annotated[
+        list[IgdbExternalGame],
+        _lenient_list(IgdbExternalGame, DropReason.EXTERNAL_GAME_INVALID),
+    ] = []
+
+    @property
+    def steam_app_ids(self) -> list[int]:
+        """The game's Steam app ids, lowest first, each once. An entry of another store, or a Steam
+        one whose `uid` is not a plain number, is left out: a game with none has no trailer."""
+        found = {
+            int(entry.uid)
+            for entry in self.external_games
+            if entry.external_game_source == STEAM_SOURCE_ID
+            and STEAM_APP_ID.fullmatch(entry.uid) is not None
+        }
+        return sorted(found)
 
     @property
     def release_year(self) -> int | None:

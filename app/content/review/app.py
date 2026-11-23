@@ -208,6 +208,7 @@ def _draft_view(puzzle: Puzzle, queue_size: int) -> html.DraftView:
         clues=clues,
         queue_size=queue_size,
         can_rebuild=actions.can_rebuild(i for ids in per_step.values() for i in ids),
+        clip_trailer=actions.clip_trailer(per_step),
         clip_from_stills=actions.clip_is_from_stills(per_step),
     )
 

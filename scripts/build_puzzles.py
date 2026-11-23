@@ -16,7 +16,10 @@ other than `local` is refused (AC-2). `--dry-run` takes `--target` too (the plan
 every step but the writes, keeps its files in the working folder (`CONTENT_WORK_DIR`) and writes
 nothing to the database or storage (AC-45). Answers are printed only with `--show-answers`.
 Needs PUZZLE_SEED_SALT, IGDB_CLIENT_ID and IGDB_CLIENT_SECRET in `.env` (never commit or print
-them) and the app's own settings.
+them) and the app's own settings. Step 6 is cut from the middle of the game's Steam trailer
+(`store.steampowered.com`, no key needed; the calls are spaced 1.6 s apart); a game with no Steam id
+or no readable trailer gets a slideshow of screenshots instead, and the report says which and why
+(a Steam outage does not stop the run, it makes slideshows and is counted).
 
 `--give-up SLOT` gives up rebuilding a slot: its `rebuild` rows become one `never` exclusion of the
 title, which frees the slot for a new answer. It needs the target but not IGDB or the salt, and
@@ -75,6 +78,7 @@ from app.content.fetch import FetchError
 from app.content.igdb import DropReason, IgdbClient, IgdbError, SkipReason
 from app.content.seed import SaltError
 from app.content.settings import ContentSettings, MissingSettingError
+from app.content.steam import SteamClient
 from app.content.target import TargetRefusedError, check_image_gate, check_target
 from app.core.clock import get_now, utc_today
 from app.media.writer import MediaWriteError, build_media_writer
@@ -185,6 +189,7 @@ async def run_build(
     async with (
         IgdbClient.from_settings(settings) as igdb,
         ImageFetcher() as images,
+        SteamClient() as steam,
         database_session() as db,
     ):
         builder = Builder(
@@ -198,6 +203,7 @@ async def run_build(
             fetch_image=images.fetch,
             writer=writer,
             dry_run=args.dry_run,
+            trailers=steam,
         )
         await builder.run(request, report)
 

@@ -1,8 +1,9 @@
-"""Clue media for the puzzle builder (SPEC-04 AC-34 to AC-40).
+"""Clue media for the puzzle builder (SPEC-04 AC-34 to AC-40, owner decision 75).
 
-Pure functions over files: no database, no network. Pillow writes the images (WebP, metadata
-dropped) and draws the clip frame by frame; PyAV encodes the clip (H.264 `yuv420p`, `+faststart`,
-no audio) and reads the files back. Every function that writes a file returns the facts measured
+Pure functions over files and bytes: no database, no network. Pillow writes the images (WebP,
+metadata dropped, clear cuts of the screenshots) and draws the slideshow clip frame by frame; PyAV
+encodes the clips (H.264 `yuv420p`, `+faststart`, no audio), cuts a segment out of a Steam trailer
+and reads the files back. Every function that writes a file returns the facts measured
 from that file (`measure`), and the builder stores those, never the intended values (AC-39).
 
 The numbers below are start values for the owner to tune after the first real drafts (AC-34).
@@ -11,8 +12,9 @@ The limits table equals "Limits for the files of a clue" in `CONTRACTS.md` (SPEC
 
 from __future__ import annotations
 
+import io
 import random
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -43,14 +45,42 @@ LIMITS: dict[str, Limits] = {
 # Quality steps for a WebP, highest first; the first one under the size limit wins (AC-35, AC-39).
 WEBP_QUALITIES = (82, 74, 66, 58, 50)
 
-# Step 1: a pixelated crop of about a third of the screenshot's width (AC-34).
-CROP_WIDTH_FRACTION = Fraction(1, 3)
-CROP_BLOCK_PX = 20
-CROP_OUTPUT = (960, 540)
+# Steps 1 to 5: clear cuts of five different screenshots, growing with the step (AC-34, decision 75).
+# The width of each cut as a fraction of its screenshot's; step 5 is the whole screenshot. A cut keeps
+# the screenshot's aspect ratio and its own pixels: it is never enlarged.
+CUT_WIDTH_FRACTIONS = (
+    Fraction(1, 4),
+    Fraction(7, 20),
+    Fraction(1, 2),
+    Fraction(7, 10),
+    Fraction(1),
+)
+# Where the cuts of steps 1 to 4 sit: how far the cut's centre is from the screenshot's centre, as a
+# fraction of the screenshot's width, drawn from (low, high). Step 1 is near a side; each band is
+# closer to the centre than the one before, and the bands do not overlap, so a later cut is always
+# closer. The side (left or right) is drawn once per puzzle and kept for the four cuts.
+CUT_CENTRE_DISTANCES = (
+    (0.26, 0.33),
+    (0.15, 0.21),
+    (0.05, 0.10),
+    (0.00, 0.02),
+)
+# The top and bottom of a screenshot usually hold the HUD (health bars, minimaps, prompts), so a cut
+# keeps this fraction of the height clear of both edges, when the cut leaves that much room. Only
+# the vertical margin is kept: step 1 sits at a side on purpose.
+CUT_VERTICAL_MARGIN = 0.06
 
-# Step 6: a muted looping clip of 2 or 3 screenshots (AC-36). CRF steps are tried in this order
-# (a higher CRF is a smaller file) until the clip is under the size limit.
+# Step 6: a muted looping clip (AC-36). The slideshow of 2 or 3 screenshots is the fallback; the
+# first choice is a segment of a Steam trailer, re-encoded at the trailer's own size (at most
+# 1280x720) and at most `CLIP_TRAILER_FPS` frames a second. CRF steps are tried in this order (a
+# higher CRF is a smaller file) until the clip is under the size limit.
 CLIP_SIZE = (1280, 720)
+CLIP_TRAILER_FPS = 30
+# The largest picture a trailer may have before it is decoded: generous (a 1080p variant passes, the
+# coded height of 1080p is 1088), because a small buffer can declare a huge size and a decoder would
+# allocate for it. Each decoded frame is checked too, since H.264 can change size mid-stream.
+TRAILER_SOURCE_MAX = (1920, 1088)
+TRAILER_SOURCE_MAX_PIXELS = 1920 * 1088
 CLIP_SECONDS = 12
 CLIP_FPS = 24
 CLIP_FADE_SECONDS = 1
@@ -180,30 +210,55 @@ def still(source: Path, out: Path) -> MediaFacts:
     return _checked(out)
 
 
-def crop_box(size: tuple[int, int], rng: random.Random) -> tuple[int, int, int, int]:
-    """The step-1 crop window: a third of the width in the output's aspect, placed by `rng`."""
+@dataclass(frozen=True)
+class CutPlacement:
+    """Where one cut sits, as fractions, so it applies to a screenshot of any size."""
+
+    dx: float  # The cut's centre minus the image's, in image widths; negative is left of centre.
+    dy: float  # 0 to 1: where the cut sits between the top and the bottom of the allowed band.
+
+
+def cut_placements(rng: random.Random) -> tuple[CutPlacement, ...]:
+    """The placements of steps 1 to 4, from the `crop` stream: one side for all four, a distance
+    from the centre in each step's band (`CUT_CENTRE_DISTANCES`) and a vertical position. Only
+    `random()` is used, so the numbers are stable across Python versions."""
+    side = -1.0 if rng.random() < 0.5 else 1.0
+    placements = []
+    for low, high in CUT_CENTRE_DISTANCES:
+        distance = low + rng.random() * (high - low)
+        placements.append(CutPlacement(side * distance, rng.random()))
+    return tuple(placements)
+
+
+def cut_box(
+    size: tuple[int, int], fraction: Fraction, placement: CutPlacement
+) -> tuple[int, int, int, int]:
+    """The window of a cut: `fraction` of the width and of the height (the screenshot's aspect
+    ratio), its centre `placement.dx` widths from the centre, always inside the image. The window
+    stays `CUT_VERTICAL_MARGIN` of the height clear of the top and bottom when there is room."""
     width, height = size
-    crop_w = round(width * CROP_WIDTH_FRACTION)
-    crop_h = round(crop_w * CROP_OUTPUT[1] / CROP_OUTPUT[0])
-    if crop_h > height:  # A very wide, low screenshot: the height limits the window.
-        crop_h = height
-        crop_w = round(crop_h * CROP_OUTPUT[0] / CROP_OUTPUT[1])
-    left = rng.randint(0, width - crop_w)
-    top = rng.randint(0, height - crop_h)
-    return (left, top, left + crop_w, top + crop_h)
+    window_w = round(width * fraction)
+    window_h = round(height * fraction)
+    left = round(width / 2 + placement.dx * width - window_w / 2)
+    left = min(max(left, 0), width - window_w)
+    margin = min(CUT_VERTICAL_MARGIN * height, (height - window_h) / 2)
+    top = round(margin + placement.dy * (height - window_h - 2 * margin))
+    top = min(max(top, 0), height - window_h)
+    return (left, top, left + window_w, top + window_h)
 
 
-def pixelated_crop(source: Path, out: Path, rng: random.Random) -> MediaFacts:
-    """Step 1: a crop of `source`, averaged into blocks of about 20 px, enlarged with no smoothing.
-
-    `source` must be a screenshot used in no other step (AC-34); the builder chooses it. The result
-    is lossless WebP, so the blocks stay flat.
-    """
+def cut(source: Path, out: Path, step: int, placement: CutPlacement) -> MediaFacts:
+    """Steps 1 to 4: a clear cut of `source`, `CUT_WIDTH_FRACTIONS[step - 1]` of its width, with its
+    own pixels (never enlarged, no pixelation), as WebP with no metadata. The screenshot is fitted
+    within 1920x1080 first, as `still` does. `source` must be a screenshot used in no other step
+    (AC-34); the builder chooses it. Step 5 is `still`."""
+    if not 1 <= step <= len(CUT_CENTRE_DISTANCES):
+        raise ValueError("a cut is for steps 1 to 4; step 5 is the whole screenshot (still)")
     image = _open_rgb(source)
-    box = crop_box(image.size, rng)
-    blocks = (CROP_OUTPUT[0] // CROP_BLOCK_PX, CROP_OUTPUT[1] // CROP_BLOCK_PX)
-    small = image.resize(blocks, Image.Resampling.BOX, box=box)
-    _save_webp(small.resize(CROP_OUTPUT, Image.Resampling.NEAREST), out, lossless=True)
+    limits = LIMITS[IMAGE_CONTENT_TYPE]
+    image.thumbnail((limits.max_width, limits.max_height), Image.Resampling.LANCZOS)
+    box = cut_box(image.size, CUT_WIDTH_FRACTIONS[step - 1], placement)
+    _save_webp(image.crop(box), out)
     return _checked(out)
 
 
@@ -294,6 +349,24 @@ def _encode(
         container.mux(stream.encode())
 
 
+def _encode_within_limit(
+    out_mp4: Path,
+    make_frames: Callable[[], Iterator[Image.Image]],
+    size: tuple[int, int],
+    fps: int,
+) -> MediaFacts:
+    """Encode `make_frames()` with each CRF in `CLIP_CRFS` until the file is under 4 MB, then
+    measure and check it. The frames are drawn again per attempt: 288 of them do not fit in memory.
+    `MediaLimitError`, and no file, when even the last CRF is too big."""
+    max_bytes = LIMITS[VIDEO_CONTENT_TYPE].max_bytes
+    for crf in CLIP_CRFS:
+        _encode(out_mp4, make_frames(), size, fps, crf)
+        if out_mp4.stat().st_size <= max_bytes:
+            return _checked(out_mp4)
+    out_mp4.unlink(missing_ok=True)
+    raise MediaLimitError(f"{out_mp4.name} does not fit in {max_bytes} bytes")
+
+
 def clip(
     sources: list[Path],
     out_mp4: Path,
@@ -303,7 +376,8 @@ def clip(
     fps: int = CLIP_FPS,
     seconds: int = CLIP_SECONDS,
 ) -> MediaFacts:
-    """Step 6: a silent MP4 of 2 or 3 screenshots (a slow pan and zoom, 1 s cross-fades).
+    """Step 6, the fallback: a silent MP4 of 2 or 3 screenshots (a slow pan and zoom, 1 s
+    cross-fades), for a game with no usable Steam trailer.
 
     The CRF is raised in steps until the file is under 4 MB. `size`, `fps` and `seconds` default
     to the real clip; the tests make a smaller one.
@@ -313,16 +387,95 @@ def clip(
     if size[0] % 2 or size[1] % 2:
         raise ValueError("a yuv420p clip needs even dimensions")
     shots = [_make_shot(_open_rgb(source), size, rng) for source in sources]
-    max_bytes = LIMITS[VIDEO_CONTENT_TYPE].max_bytes
-    for (
-        crf
-    ) in CLIP_CRFS:  # The frames are drawn again per attempt: 288 of them do not fit in memory.
-        frames = _clip_frames(shots, size, fps, seconds, CLIP_FADE_SECONDS)
-        _encode(out_mp4, frames, size, fps, crf)
-        if out_mp4.stat().st_size <= max_bytes:
-            return _checked(out_mp4)
-    out_mp4.unlink(missing_ok=True)
-    raise MediaLimitError(f"{out_mp4.name} does not fit in {max_bytes} bytes")
+    return _encode_within_limit(
+        out_mp4, lambda: _clip_frames(shots, size, fps, seconds, CLIP_FADE_SECONDS), size, fps
+    )
+
+
+def _fitted_size(size: tuple[int, int]) -> tuple[int, int]:
+    """`size` scaled down (never up) to fit `CLIP_SIZE`, with even sides for yuv420p."""
+    scale = min(1.0, CLIP_SIZE[0] / size[0], CLIP_SIZE[1] / size[1])
+    width, height = (max(2, int(side * scale) // 2 * 2) for side in size)
+    return width, height
+
+
+def _check_source_size(width: int, height: int) -> None:
+    """Refuse a trailer picture that is empty or larger than `TRAILER_SOURCE_MAX`."""
+    if width <= 0 or height <= 0:
+        raise MediaLimitError("the trailer has an empty picture size")
+    if (
+        width > TRAILER_SOURCE_MAX[0]
+        or height > TRAILER_SOURCE_MAX[1]
+        or width * height > TRAILER_SOURCE_MAX_PIXELS
+    ):
+        raise MediaLimitError("the trailer picture is too large")
+
+
+def _trailer_frames(
+    data: bytes, offset: float, seconds: int, fps: int, size: tuple[int, int]
+) -> Iterator[Image.Image]:
+    """`seconds * fps` frames from the video of `data`, starting `offset` seconds after its first
+    frame, at a constant `fps` (each output frame is the latest source frame at its time), scaled to
+    `size`. Only the video stream is read, so an audio track is never carried over, and decoding
+    stops as soon as the clip has its frames. Raises `MediaLimitError` when the data ends before the
+    clip does or a frame is empty or too large."""
+    total = seconds * fps
+    current: Image.Image | None = None
+    current_time = gap = 0.0
+    produced = 0
+    first_time: float | None = None
+    with av.open(io.BytesIO(data)) as container:
+        for frame in container.decode(video=0):
+            _check_source_size(frame.width, frame.height)
+            if frame.time is None:
+                raise MediaLimitError("a trailer frame has no time")
+            if first_time is None:
+                first_time = frame.time
+            at = frame.time - first_time - offset
+            while current is not None and produced < total and produced / fps < at:
+                yield current
+                produced += 1
+            if produced >= total:
+                return
+            gap = at - current_time if current is not None else 0.0
+            current, current_time = _scaled(frame, size), at
+        # The data ended: its last frame (shown for as long as the one before it was) fills what is
+        # left, unless the data stops before the last frame of the clip.
+        if current is None or current_time + gap < seconds - 1 / fps:
+            raise MediaLimitError("the trailer segment is shorter than the clip")
+        while produced < total:
+            yield current
+            produced += 1
+
+
+def _scaled(frame: av.VideoFrame, size: tuple[int, int]) -> Image.Image:
+    """The frame as RGB at `size`. Trailers are HD, so BT.709 is the matrix, as the clip is tagged."""
+    if (frame.width, frame.height) == size:
+        return frame.to_image(src_colorspace=Colorspace.ITU709)
+    return frame.to_image(width=size[0], height=size[1], src_colorspace=Colorspace.ITU709)
+
+
+def trailer_clip(
+    data: bytes,
+    out_mp4: Path,
+    *,
+    offset: float,
+    fps: int = CLIP_TRAILER_FPS,
+    seconds: int = CLIP_SECONDS,
+) -> MediaFacts:
+    """Step 6: `seconds` of the video in `data` (a trailer's init segment and pieces, in one
+    buffer), from `offset` seconds after its first frame, re-encoded as H.264 `yuv420p`,
+    `+faststart`, no audio, at the trailer's own size fitted to 1280x720. The CRF is raised in steps
+    until the file is under 4 MB (`MediaLimitError` when it never is). The poster is `poster`."""
+    with av.open(io.BytesIO(data)) as container:
+        if not container.streams.video:
+            raise MediaLimitError("the trailer has no video stream")
+        context = container.streams.video[0].codec_context
+        _check_source_size(context.width, context.height)  # before anything is decoded
+        size = _fitted_size((context.width, context.height))
+    return _encode_within_limit(
+        out_mp4, lambda: _trailer_frames(data, offset, seconds, fps, size), size, fps
+    )
 
 
 def first_frame(clip_mp4: Path) -> Image.Image:

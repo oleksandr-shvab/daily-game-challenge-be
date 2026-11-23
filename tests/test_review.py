@@ -719,7 +719,7 @@ async def test__draft_page_forms__work_with_the_pages_own_token_and_buttons(
         (f"/drafts/{few_id}/reject", [("reason", "never")]),
     ]
     assert "This game has too few screenshots to rebuild; reject as Never" in few_page
-    assert few_page.count("Clip made from the stills (decision 74)") == 1
+    assert few_page.count("Slideshow of the stills (decision 74)") == 1
     # The server refuses it too, with the button hidden or not.
     forms = read_forms(few_page)
     response = await page.post(forms[1].action, data={**forms[1].hidden, "reason": "rebuild"})
@@ -727,13 +727,14 @@ async def test__draft_page_forms__work_with_the_pages_own_token_and_buttons(
     assert await world.status_of(few_id) == PuzzleStatus.IN_REVIEW
     assert await world.count(AnswerExclusion) == 0
 
-    # A draft with a clip of its own has both, and no label or note. A clip that has one still
-    # and one other screenshot is not "made from the stills".
+    # A draft with a clip of its own has both buttons and no note, and its clip is a slideshow. A
+    # clip that has one still and one other screenshot is not "from the stills".
     own_page = (await page.get(f"/drafts/{rebuilt_id}")).text
-    assert "too few screenshots" not in own_page and "made from the stills" not in own_page
-    assert "made from the stills" not in (await page.get(f"/drafts/{mixed_id}")).text
+    assert "too few screenshots" not in own_page and "Slideshow of screenshots" in own_page
+    assert "of the stills" not in own_page
+    assert "of the stills" not in (await page.get(f"/drafts/{mixed_id}")).text
     # Only steps 2 to 5 count: a clip that reuses the crop's screenshot is not from the stills.
-    assert "made from the stills" not in (await page.get(f"/drafts/{crop_clip_id}")).text
+    assert "of the stills" not in (await page.get(f"/drafts/{crop_clip_id}")).text
 
     forms = read_forms((await page.get(f"/drafts/{rebuilt_id}")).text)
 
@@ -749,6 +750,47 @@ async def test__draft_page_forms__work_with_the_pages_own_token_and_buttons(
     response = await page.post(forms[0].action, data=forms[0].hidden)
     assert response.status_code == 303
     assert await world.status_of(approved_id) == PuzzleStatus.APPROVED
+
+
+async def test__draft_page__says_whether_step_6_is_a_steam_trailer_or_a_slideshow(
+    world: World, page: AsyncClient
+) -> None:
+    # A trailer draft lists its marker first, then the screenshots the plan set aside (7 in all).
+    own = [[f"img{step}"] for step in range(1, 6)]
+    trailer = await world.draft(7, image_ids=[*own, ["steam:1145360:256801252:36", "img6", "img7"]])
+    # The same from a game with 5 screenshots: the marker is not a screenshot, so no Rebuild.
+    few_trailer = await world.draft(
+        8, title=1, image_ids=[*STILLS_ONLY[:5], ["steam:7:8:9", "a", "e"]]
+    )
+    slideshow = await world.draft(9, title=2)
+    trailer_id, few_trailer_id, slideshow_id = trailer.id, few_trailer.id, slideshow.id
+
+    trailer_page = (await page.get(f"/drafts/{trailer_id}")).text
+    few_page = (await page.get(f"/drafts/{few_trailer_id}")).text
+    slideshow_page = (await page.get(f"/drafts/{slideshow_id}")).text
+
+    assert "Steam trailer (app 1145360, movie 256801252, from 36 s)" in trailer_page
+    assert "Slideshow" not in trailer_page and "steam:" not in trailer_page
+    assert "Steam trailer (app 7, movie 8, from 9 s)" in few_page and "Slideshow" not in few_page
+    assert "too few screenshots to rebuild" in few_page
+    assert "Slideshow of screenshots" in slideshow_page and "Steam trailer" not in slideshow_page
+    assert 'value="rebuild"' in trailer_page and 'value="rebuild"' not in few_page
+
+
+@pytest.mark.parametrize(
+    ("image_ids", "expected"),
+    [
+        (["a", "b", "c", "d", "e"], False),
+        (["a", "b", "c", "d", "e", "f"], False),
+        (["a", "b", "c", "d", "e", "f", "steam:1:2:3"], False),  # a marker is not a screenshot
+        (["a", "b", "c", "d", "e", "f", "g"], True),
+        (["a", "b", "c", "d", "e", "f", "g", "steam:1:2:3"], True),
+    ],
+)
+def test__can_rebuild__counts_screenshots_and_not_a_trailers_marker(
+    image_ids: list[str], expected: bool
+) -> None:
+    assert actions.can_rebuild(image_ids) is expected
 
 
 async def test__token__is_made_per_process_and_kept_for_its_life(world: World) -> None:
@@ -916,11 +958,12 @@ async def test__draft_page__shows_each_clue_as_the_player_sees_it(
     assert "2007" in markup.text and "Aperture" in markup.text
     assert markup.text.count("no hint") == 1  # step 3
     assert len(markup.find("input")) - 2 == 5  # the checklist, apart from the two tokens
-    # A clip made of the stills is not a defect, so the item does not ask the clip to add something.
+    # AC-48: the reviewer looks for titles or logos and for no gameplay in the clip; a slideshow
+    # (the seeded draft's clip) only has to play.
     assert (
-        "The clip plays (it may reuse the stills when the game has few screenshots)" in markup.text
+        "The clip plays, shows gameplay and no title, logo or game name (a slideshow only has to play)"
+        in markup.text
     )
-    assert "adds something" not in markup.text
     other_page = Markup((await page.get(f"/drafts/{other.id}")).text)
     assert other_page.text.count("no file") == 1
     assert len(other_page.find("img")) == 4

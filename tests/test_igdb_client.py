@@ -573,3 +573,39 @@ def test__content_settings__missing_credential_stops_before_any_request(monkeypa
         _env_file=None, IGDB_CLIENT_ID=CLIENT_ID, IGDB_CLIENT_SECRET=CLIENT_SECRET
     )
     assert CLIENT_SECRET not in repr(full) + str(full)
+
+
+@pytest.mark.parametrize(
+    ("external_games", "expected"),
+    [
+        (None, []),
+        ([], []),
+        ([{"uid": "1145360", "external_game_source": 1}], [1145360]),
+        ([{"uid": "1207658930", "external_game_source": 5}], []),  # another store (GOG)
+        ([{"uid": "abc", "external_game_source": 1}], []),  # not a number
+        ([{"uid": "0", "external_game_source": 1}], []),  # not an app id
+        ([{"uid": "12345678901", "external_game_source": 1}], []),  # too long
+        ([{"uid": "292030"}, {"uid": "2", "external_game_source": None}], []),
+        (
+            [
+                {"uid": "570", "external_game_source": 1},
+                {"uid": "10", "external_game_source": 1},
+                {"uid": "570", "external_game_source": 1},
+                {"uid": "9", "external_game_source": 5},
+            ],
+            [10, 570],  # lowest first, each once
+        ),
+        ([{"uid": 570, "external_game_source": 1}, {"uid": "7", "external_game_source": 1}], [7]),
+    ],
+)
+def test__steam_app_ids__come_from_external_games_source_1_and_a_bad_entry_is_dropped(
+    external_games: list[dict[str, object]] | None, expected: list[int]
+) -> None:
+    drops: Counter[DropReason] = Counter()
+    raw = {"id": 1, "name": "Game", "slug": "game", "external_games": external_games}
+
+    game = parse_game(raw, max_year=2027, skips=Counter(), drops=drops)
+
+    assert game is not None and game.steam_app_ids == expected
+    invalid = sum(not isinstance(entry.get("uid"), str) for entry in external_games or [])
+    assert drops == ({DropReason.EXTERNAL_GAME_INVALID: invalid} if invalid else {})

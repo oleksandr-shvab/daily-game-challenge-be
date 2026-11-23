@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.content.builder import GENERATOR_VERSION
 from app.content.candidates import (
     CANDIDATE_TYPES,
     REBUILD_SCREENSHOTS,
@@ -239,55 +240,58 @@ def test__assign_screenshots__skips_avoided_ones_and_ignores_input_order() -> No
 
 def test__assign_screenshots__golden_plans_do_not_change_with_the_python_version() -> None:
     """The draws use only `random()`, so these ids hold on any Python. If this goes red, the choice
-    logic changed: raise the builder's GENERATOR_VERSION."""
+    logic changed: raise the builder's GENERATOR_VERSION. These are the draws of a version "2" seed
+    (owner decision 75 raised it from "1"; the version is part of every seed, so every slot draws
+    other screenshots; the version "1" plans are in Git history)."""
+    assert GENERATOR_VERSION == "2"
 
     def plan(count: int, slot: int) -> list[str]:
         stream = SlotSeed(
-            SecretStr(TEST_SALT), "game-guesser", "default", slot, "1", other_secrets=()
+            SecretStr(TEST_SALT), "game-guesser", "default", slot, "2", other_secrets=()
         ).stream(Purpose.SCREENSHOTS)
         game = make_game(screenshots=shots(count))
         return assign_screenshots(game, stream, set(), settings=SETTINGS).image_ids
 
     assert [plan(10, slot) for slot in (1, 2, 3)] == [
-        ["shot07", "shot08", "shot03", "shot04", "shot05", "shot06", "shot09"],
-        ["shot08", "shot00", "shot03", "shot01", "shot04", "shot05", "shot06"],
-        ["shot09", "shot00", "shot01", "shot07", "shot08", "shot06", "shot04"],
+        ["shot07", "shot04", "shot05", "shot03", "shot02", "shot06", "shot09"],
+        ["shot09", "shot00", "shot02", "shot03", "shot05", "shot01", "shot04"],
+        ["shot00", "shot09", "shot01", "shot05", "shot04", "shot07", "shot08"],
     ]
     # 20 screenshots: slot 1 draws a clip of three (the cap allows it from 15), slot 2 of two.
     assert [plan(20, slot) for slot in (1, 2)] == [
-        ["shot15", "shot17", "shot07", "shot08", "shot09", "shot14", "shot13", "shot16"],
-        ["shot17", "shot00", "shot06", "shot02", "shot04", "shot07", "shot10"],
+        ["shot12", "shot09", "shot10", "shot07", "shot05", "shot08", "shot19", "shot14"],
+        ["shot17", "shot01", "shot03", "shot06", "shot09", "shot00", "shot07"],
     ]
 
     # Decision 74: 5 and 6 screenshots. The plan lists the crop and the four stills; the clip is
-    # two or three of the stills, drawn after them (slot 1 of 5 and slot 1 of 6 draw three).
+    # two or three of the stills, drawn after them (slots 1 and 3 of 5, and slot 1 of 6, draw three).
     def clip(count: int, slot: int) -> list[str]:
         stream = SlotSeed(
-            SecretStr(TEST_SALT), "game-guesser", "default", slot, "1", other_secrets=()
+            SecretStr(TEST_SALT), "game-guesser", "default", slot, "2", other_secrets=()
         ).stream(Purpose.SCREENSHOTS)
         game = make_game(screenshots=shots(count))
         plan = assign_screenshots(game, stream, set(), settings=SETTINGS)
         return [shot.image_id for shot in plan.clip]
 
     assert [plan(5, slot) for slot in (1, 2, 3)] == [
-        ["shot03", "shot04", "shot01", "shot02", "shot00"],
-        ["shot04", "shot00", "shot02", "shot01", "shot03"],
-        ["shot02", "shot00", "shot01", "shot04", "shot03"],
+        ["shot04", "shot02", "shot03", "shot01", "shot00"],
+        ["shot04", "shot00", "shot01", "shot02", "shot03"],
+        ["shot01", "shot04", "shot00", "shot02", "shot03"],
     ]
     assert [clip(5, slot) for slot in (1, 2, 3)] == [
-        ["shot00", "shot02", "shot01"],
+        ["shot03", "shot00", "shot01"],
         ["shot00", "shot01"],
-        ["shot03", "shot01"],
+        ["shot02", "shot03", "shot00"],
     ]
     assert [plan(6, slot) for slot in (1, 2, 3)] == [
-        ["shot04", "shot05", "shot02", "shot01", "shot03"],
-        ["shot05", "shot00", "shot02", "shot01", "shot03"],
-        ["shot03", "shot00", "shot01", "shot04", "shot05"],
+        ["shot05", "shot02", "shot03", "shot01", "shot00"],
+        ["shot05", "shot00", "shot01", "shot02", "shot04"],
+        ["shot00", "shot05", "shot01", "shot03", "shot02"],
     ]
     assert [clip(6, slot) for slot in (1, 2, 3)] == [
-        ["shot03", "shot01", "shot02"],
+        ["shot03", "shot00", "shot01"],
         ["shot00", "shot01"],
-        ["shot05", "shot01"],
+        ["shot03", "shot02", "shot01"],
     ]
 
 
