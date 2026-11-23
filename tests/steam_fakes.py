@@ -8,6 +8,7 @@ Pieces are one second each (a real trailer's are about three; the code goes by `
 import functools
 import io
 import struct
+from collections.abc import Callable
 from fractions import Fraction
 from urllib.parse import parse_qs, urlsplit
 
@@ -57,15 +58,17 @@ class FakeSteam:
     """`apps` maps a Steam app id to its movie ids. Every movie is a `seconds` long trailer with
     three variants; only the 1280x720 one is served with pieces (the others answer 404, so a client
     that picked them would fail). `requests` lists every URL asked, in order. `answers` replaces the
-    answer to any URL that contains one of its keys: a status code, an exception to raise, or a
-    ready `httpx.Response`."""
+    answer to any URL that contains one of its keys: a status code, an exception to raise, a
+    ready `httpx.Response` or a function of the request that makes one."""
 
     def __init__(self, apps: dict[int, list[int]], *, seconds: int = 60) -> None:
         self.apps = apps
         self.seconds = seconds
         self.init, self.pieces = fmp4_trailer(seconds)
         self.requests: list[str] = []
-        self.answers: dict[str, int | Exception | httpx.Response] = {}
+        self.answers: dict[
+            str, int | Exception | httpx.Response | Callable[[httpx.Request], httpx.Response]
+        ] = {}
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -96,6 +99,8 @@ class FakeSteam:
             if part in url:
                 if isinstance(answer, Exception):
                     raise answer
+                if callable(answer):
+                    return answer(request)
                 return httpx.Response(answer) if isinstance(answer, int) else answer
         parts = urlsplit(url)
         if url.startswith(STORE_URL):

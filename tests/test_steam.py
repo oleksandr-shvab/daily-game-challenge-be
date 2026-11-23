@@ -2,6 +2,7 @@
 (`tests/steam_fakes.py`): which part of a trailer is cut, every way to have no trailer, the allow
 list, and what a rebuild changes. No network."""
 
+import asyncio
 import random
 from typing import Any
 
@@ -60,6 +61,32 @@ BAD_MASTER = httpx.Response(
     text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1280x720\nhttps://evil.example/x.m3u8",
 )
 UNFINISHED = httpx.Response(200, text='#EXTM3U\n#EXT-X-MAP:URI="init.m4s"\n#EXTINF:3,\np.m4s')
+
+
+def media_playlist(
+    map_lines: str = '#EXT-X-MAP:URI="init.m4s"', *, piece: str | None = None
+) -> httpx.Response:
+    """A good 60 piece playlist of the fake, with `map_lines` as its map and optionally one piece
+    URI replaced: each way a playlist can be bad is a row that changes one thing."""
+    names = [piece if piece and n == 20 else f"p{n:05d}.m4s" for n in range(60)]
+    body = [f"#EXTINF:1.000,\n{name}" for name in names]
+    return httpx.Response(200, text="\n".join(["#EXTM3U", map_lines, *body, "#EXT-X-ENDLIST"]))
+
+
+def master_with(uri: str) -> httpx.Response:
+    return httpx.Response(
+        200, text=f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1280x720\n{uri}"
+    )
+
+
+class Trickle(httpx.AsyncByteStream):
+    """A body that sends a byte and then stalls, so only a deadline over the whole request ends it."""
+
+    async def __aiter__(self) -> Any:
+        yield b"x"
+        await asyncio.sleep(2)
+
+
 FOREIGN_MOVIE = httpx.Response(
     200,
     json={
@@ -90,16 +117,30 @@ FOREIGN_MOVIE = httpx.Response(
         ({".m4s": 502}, [100], 60, FallbackReason.STEAM_UNAVAILABLE),
         ({".m4s": httpx.Response(302, headers={"location": "https://evil.example/x"})}, [100], 60, FallbackReason.UNREADABLE),
         ({}, [100], 8, FallbackReason.UNREADABLE),  # a trailer shorter than the clip
+        ({"hls_264_master": master_with("//[x/y.m3u8")}, [100], 60, FallbackReason.UNREADABLE),
+        ({"1280x720/index.m3u8": media_playlist(piece="//[x/p.m4s")}, [100], 60, FallbackReason.UNREADABLE),
+        ({"hls_264_master": master_with("a" * 3000 + ".m3u8")}, [100], 60, FallbackReason.UNREADABLE),
+        ({"appdetails": httpx.Response(200, text="[" * 200_000)}, [100], 60, FallbackReason.UNREADABLE),
+        ({"1280x720/index.m3u8": media_playlist('#EXT-X-MAP:URI="init.m4s",BYTERANGE="720@0"')}, [100], 60, FallbackReason.UNREADABLE),
+        ({"1280x720/index.m3u8": media_playlist('#EXT-X-MAP:URI="init.m4s"\n#EXT-X-MAP:URI="other.m4s"')}, [100], 60, FallbackReason.UNREADABLE),
+        ({".m4s": lambda request: httpx.Response(200, stream=Trickle())}, [100], 60, FallbackReason.STEAM_UNAVAILABLE),
     ],
     ids=[
         "no-steam-id", "unknown-app", "movie-on-a-foreign-host", "appdetails-404", "appdetails-429",
         "appdetails-503", "no-answer", "appdetails-403", "not-json", "master-404", "variant-on-a-foreign-host",
         "playlist-not-finished", "piece-404", "piece-502", "piece-redirect", "too-short",
+        "variant-uri-urljoin-error", "piece-uri-urljoin-error", "very-long-url", "deeply-nested-json",
+        "init-byterange", "two-init-segments", "trickling-piece",
     ],
 )  # fmt: skip
 async def test__find__every_way_to_have_no_trailer_is_a_named_reason_and_never_leaves_the_host_list(
-    answers: dict[str, Any], app_ids: list[int], seconds: int, expected: FallbackReason
+    answers: dict[str, Any],
+    app_ids: list[int],
+    seconds: int,
+    expected: FallbackReason,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(fetch, "REQUEST_DEADLINE_SECONDS", 0.2)  # only the trickling row waits
     fake = FakeSteam({100: [1]}, seconds=seconds)
     fake.answers.update(answers)
     clock = Clock()
@@ -147,6 +188,9 @@ async def test__find__spaces_the_store_calls_and_after_an_outage_asks_no_more() 
         asked = len(fake.requests)
         with pytest.raises(NoTrailer) as second:
             await client.find([1], avoid=(), stream=random.Random(1), seconds=SECONDS)
+        with pytest.raises(NoTrailer) as no_id:  # a game with no Steam id is still just that
+            await client.find([], avoid=(), stream=random.Random(1), seconds=SECONDS)
+    assert no_id.value.reason == FallbackReason.NO_STEAM_ID
 
     assert first.value.reason == second.value.reason == FallbackReason.STEAM_UNAVAILABLE
     assert asked == 6 and len(fake.requests) == asked  # the second slot made no request
@@ -158,6 +202,17 @@ async def test__find__a_rebuild_takes_another_movie_or_a_segment_no_rejected_dra
     first = await find(fake, seed=5)
     again = await find(fake, seed=5, avoid=["abc123", str(first.marker)])
     assert again.marker.movie_id != first.marker.movie_id
+
+    # Two apps, one movie each: the rejected draft's movie comes after the other app's unused one,
+    # whichever app is read first.
+    fake = FakeSteam({100: [1], 200: [2]})
+    for seed in range(6):
+        first = await find(fake, [100, 200], seed=seed)
+        again = await find(fake, [100, 200], seed=seed, avoid=[str(first.marker)])
+        assert (again.marker.app_id, again.marker.movie_id) != (
+            first.marker.app_id,
+            first.marker.movie_id,
+        )
 
     # One movie: each rebuild gets a clip that overlaps no rejected one, until none is left.
     fake = FakeSteam({100: [1]})
@@ -174,6 +229,43 @@ async def test__find__a_rebuild_takes_another_movie_or_a_segment_no_rejected_dra
     else:
         pytest.fail("a 60 s trailer has no room for five clips of 12 s")
     assert 1 <= len(used) <= 3 and round_number == len(used)
+
+
+async def test__find__one_failing_trailer_object_fails_that_movie_and_only_a_run_of_them_turns_steam_off() -> (
+    None
+):
+    # Movie 1's init segment is gone; movie 2 is fine. Whichever comes first, the clip is movie 2's
+    # and the client stays on.
+    tried_first = 0
+    for seed in range(8):
+        fake = FakeSteam({100: [1, 2]})
+        fake.answers["/100/1/1280x720/init.m4s"] = 502
+        async with new_client(fake) as client:
+            trailer = await client.find(
+                [100], avoid=(), stream=random.Random(seed), seconds=SECONDS
+            )
+            assert trailer.marker.movie_id == 2 and not client.is_unavailable
+        tried_first += any("/100/1/1280x720/init.m4s" in url for url in fake.requests)
+    assert tried_first > 0  # the failing movie really was tried before the good one
+
+    # Three movies that all fail on the trailer host in a row do turn it off for the run.
+    fake = FakeSteam({100: [1, 2, 3]})
+    fake.answers["init.m4s"] = 502
+    async with new_client(fake) as client:
+        with pytest.raises(NoTrailer) as raised:
+            await client.find([100], avoid=(), stream=random.Random(1), seconds=SECONDS)
+        assert raised.value.reason == FallbackReason.STEAM_UNAVAILABLE and client.is_unavailable
+        asked = len(fake.requests)
+        with pytest.raises(NoTrailer):
+            await client.find([100], avoid=(), stream=random.Random(1), seconds=SECONDS)
+        assert len(fake.requests) == asked
+
+
+async def test__get__a_url_httpx_cannot_build_is_unreadable_not_a_crash() -> None:
+    async with new_client(FakeSteam({})) as client:
+        with pytest.raises(NoTrailer) as raised:
+            await client._get("https://video.akamai.steamstatic.com/" + "a" * 70_000, 10)
+    assert raised.value.reason == FallbackReason.UNREADABLE
 
 
 @pytest.mark.parametrize(

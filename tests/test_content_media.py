@@ -3,9 +3,12 @@ stills and the growing clear cuts, the slideshow and trailer clips and the poste
 part in each. Images and videos are generated here, no network. Slideshow clips are small (640x360
 at the real 24 fps and 12 s) to keep the run short."""
 
+import io
 import random
+from collections.abc import Iterator
 from itertools import pairwise
 from pathlib import Path
+from typing import Self
 
 import av
 import pytest
@@ -363,3 +366,118 @@ def test__trailer_clip__is_the_asked_segment_as_a_silent_h264_mp4_and_refuses_a_
     with pytest.raises(MediaLimitError):
         media.trailer_clip(data, tmp_path / "short.mp4", offset=12.0, fps=10, seconds=8)
     assert not (tmp_path / "short.mp4").exists()
+
+
+class FakeFrame:
+    def __init__(self, time: float, width: int, height: int) -> None:
+        self.time, self.width, self.height = time, width, height
+
+    def to_image(self, **kwargs: int) -> Image.Image:
+        return Image.new(
+            "RGB", (kwargs.get("width", self.width), kwargs.get("height", self.height))
+        )
+
+
+class FakeContainer:
+    """Stands in for an opened trailer: a header size, and frames that are counted as decoded."""
+
+    def __init__(self, header: tuple[int, int], frames: list[FakeFrame], *, video: bool = True):
+        context = type("Context", (), {"width": header[0], "height": header[1]})()
+        self.streams = type(
+            "Streams", (), {"video": [type("Stream", (), {"codec_context": context})()] * video}
+        )()
+        self.frames, self.decoded = frames, 0
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def decode(self, video: int) -> Iterator[FakeFrame]:
+        for frame in self.frames:
+            self.decoded += 1
+            yield frame
+
+
+def patch_trailer_open(monkeypatch: pytest.MonkeyPatch, container: FakeContainer) -> None:
+    """The buffer opens as `container`; the encoder's own file opens as usual."""
+    real_open = av.open
+
+    def fake_open(file: object, *args: object, **kwargs: object) -> object:
+        return container if isinstance(file, io.BytesIO) else real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(media.av, "open", fake_open)
+
+
+@pytest.mark.parametrize(
+    ("header", "frames", "video", "message"),
+    [
+        ((320, 180), [FakeFrame(0.0, 320, 180)], False, "no video stream"),
+        ((0, 180), [FakeFrame(0.0, 320, 180)], True, "empty picture"),
+        ((320, 0), [FakeFrame(0.0, 320, 180)], True, "empty picture"),
+        ((8000, 8000), [FakeFrame(0.0, 320, 180)], True, "too large"),  # declared, never decoded
+        ((320, 180), [FakeFrame(0.0, 320, 180), FakeFrame(0.1, 7680, 4320)], True, "too large"),
+        ((320, 180), [FakeFrame(0.0, 0, 180)], True, "empty picture"),
+    ],
+    ids=[
+        "no-video",
+        "zero-width",
+        "zero-height",
+        "huge-header",
+        "size-changes-mid-stream",
+        "empty-frame",
+    ],
+)
+def test__trailer_clip__refuses_what_it_cannot_safely_decode_with_a_media_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    header: tuple[int, int],
+    frames: list[FakeFrame],
+    video: bool,
+    message: str,
+) -> None:
+    container = FakeContainer(header, frames, video=video)
+    patch_trailer_open(monkeypatch, container)
+
+    with pytest.raises(MediaLimitError, match=message):
+        media.trailer_clip(b"", tmp_path / "clip.mp4", offset=0.0, fps=10, seconds=1)
+
+    assert container.decoded <= 2  # a declared size is refused before a frame is decoded
+    assert not (tmp_path / "clip.mp4").exists()
+
+
+def test__trailer_clip__a_real_buffer_with_no_video_or_a_huge_picture_is_refused(
+    tmp_path: Path,
+) -> None:
+    audio_only = tmp_path / "audio.mp4"
+    with av.open(str(audio_only), "w", format="mp4") as container:
+        track = container.add_stream("aac", rate=44100)
+        silence = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+        for plane in silence.planes:
+            plane.update(bytes(plane.buffer_size))
+        silence.sample_rate = 44100
+        for index in range(20):
+            silence.pts = index * 1024
+            container.mux(track.encode(silence))
+        container.mux(track.encode())
+    with pytest.raises(MediaLimitError, match="no video stream"):
+        media.trailer_clip(audio_only.read_bytes(), tmp_path / "a.mp4", offset=0.0, seconds=1)
+
+    big = tmp_path / "big.mp4"
+    fake_trailer(big, 2, size=(2000, 1100), audio=False)  # over 1920 wide: refused up front
+    with pytest.raises(MediaLimitError, match="too large"):
+        media.trailer_clip(big.read_bytes(), tmp_path / "b.mp4", offset=0.0, fps=10, seconds=1)
+
+
+def test__trailer_frames__stop_decoding_as_soon_as_the_clip_has_its_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = [FakeFrame(index / 10, 320, 180) for index in range(1000)]  # 100 s of video
+    container = FakeContainer((320, 180), frames)
+    patch_trailer_open(monkeypatch, container)
+
+    pictures = list(media._trailer_frames(b"", 5.0, 1, 10, (320, 180)))
+
+    assert len(pictures) == 10
+    assert container.decoded <= 5 * 10 + 10 + 2  # the lead-in and the clip, not the rest

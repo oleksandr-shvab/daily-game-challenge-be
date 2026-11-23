@@ -4,6 +4,7 @@ Every request goes only to a host on the allow list, over https, and a redirect 
 so IGDB data cannot send a script to another host. Bodies are read with a size cap.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,9 @@ ALLOWED_HOSTS = frozenset(
     }
 )
 REQUEST_TIMEOUT_SECONDS = 30.0
+# The whole of one request, from sending it to the last byte of the body. `REQUEST_TIMEOUT_SECONDS`
+# is per read, so a host that sends a byte every few seconds would never trip it.
+REQUEST_DEADLINE_SECONDS = 120.0
 MAX_BODY_BYTES = 20 * 1024 * 1024
 
 
@@ -68,18 +72,28 @@ def build_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.Asy
 
 
 async def send_capped(
-    client: httpx.AsyncClient, request: httpx.Request, *, max_bytes: int = MAX_BODY_BYTES
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+    *,
+    max_bytes: int = MAX_BODY_BYTES,
+    deadline: float | None = None,
 ) -> FetchedResponse:
-    """Send and read the body, stopping at `max_bytes` instead of reading all of it."""
-    response = await client.send(request, stream=True)
+    """Send and read the body, stopping at `max_bytes` instead of reading all of it, and giving up
+    after `deadline` seconds (default `REQUEST_DEADLINE_SECONDS`) for the whole request. Running out
+    of time raises `httpx.ReadTimeout`, so it takes the same retry path as any other timeout."""
     try:
-        chunks: list[bytes] = []
-        size = 0
-        async for chunk in response.aiter_bytes():
-            size += len(chunk)
-            if size > max_bytes:
-                raise ResponseTooLargeError("a response is larger than the size cap")
-            chunks.append(chunk)
-    finally:
-        await response.aclose()
+        async with asyncio.timeout(REQUEST_DEADLINE_SECONDS if deadline is None else deadline):
+            response = await client.send(request, stream=True)
+            try:
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ResponseTooLargeError("a response is larger than the size cap")
+                    chunks.append(chunk)
+            finally:
+                await response.aclose()
+    except TimeoutError:
+        raise httpx.ReadTimeout("the request did not finish before its deadline") from None
     return FetchedResponse(response.status_code, response.headers, b"".join(chunks))

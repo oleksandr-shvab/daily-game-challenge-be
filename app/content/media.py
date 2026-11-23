@@ -76,6 +76,11 @@ CUT_VERTICAL_MARGIN = 0.06
 # higher CRF is a smaller file) until the clip is under the size limit.
 CLIP_SIZE = (1280, 720)
 CLIP_TRAILER_FPS = 30
+# The largest picture a trailer may have before it is decoded: generous (a 1080p variant passes, the
+# coded height of 1080p is 1088), because a small buffer can declare a huge size and a decoder would
+# allocate for it. Each decoded frame is checked too, since H.264 can change size mid-stream.
+TRAILER_SOURCE_MAX = (1920, 1088)
+TRAILER_SOURCE_MAX_PIXELS = 1920 * 1088
 CLIP_SECONDS = 12
 CLIP_FPS = 24
 CLIP_FADE_SECONDS = 1
@@ -394,13 +399,26 @@ def _fitted_size(size: tuple[int, int]) -> tuple[int, int]:
     return width, height
 
 
+def _check_source_size(width: int, height: int) -> None:
+    """Refuse a trailer picture that is empty or larger than `TRAILER_SOURCE_MAX`."""
+    if width <= 0 or height <= 0:
+        raise MediaLimitError("the trailer has an empty picture size")
+    if (
+        width > TRAILER_SOURCE_MAX[0]
+        or height > TRAILER_SOURCE_MAX[1]
+        or width * height > TRAILER_SOURCE_MAX_PIXELS
+    ):
+        raise MediaLimitError("the trailer picture is too large")
+
+
 def _trailer_frames(
     data: bytes, offset: float, seconds: int, fps: int, size: tuple[int, int]
 ) -> Iterator[Image.Image]:
     """`seconds * fps` frames from the video of `data`, starting `offset` seconds after its first
     frame, at a constant `fps` (each output frame is the latest source frame at its time), scaled to
-    `size`. Only the video stream is read, so an audio track is never carried over. Raises
-    `MediaLimitError` when the data ends before the clip does."""
+    `size`. Only the video stream is read, so an audio track is never carried over, and decoding
+    stops as soon as the clip has its frames. Raises `MediaLimitError` when the data ends before the
+    clip does or a frame is empty or too large."""
     total = seconds * fps
     current: Image.Image | None = None
     current_time = gap = 0.0
@@ -408,6 +426,7 @@ def _trailer_frames(
     first_time: float | None = None
     with av.open(io.BytesIO(data)) as container:
         for frame in container.decode(video=0):
+            _check_source_size(frame.width, frame.height)
             if frame.time is None:
                 raise MediaLimitError("a trailer frame has no time")
             if first_time is None:
@@ -449,8 +468,11 @@ def trailer_clip(
     `+faststart`, no audio, at the trailer's own size fitted to 1280x720. The CRF is raised in steps
     until the file is under 4 MB (`MediaLimitError` when it never is). The poster is `poster`."""
     with av.open(io.BytesIO(data)) as container:
-        video = container.streams.video[0]
-        size = _fitted_size((video.codec_context.width, video.codec_context.height))
+        if not container.streams.video:
+            raise MediaLimitError("the trailer has no video stream")
+        context = container.streams.video[0].codec_context
+        _check_source_size(context.width, context.height)  # before anything is decoded
+        size = _fitted_size((context.width, context.height))
     return _encode_within_limit(
         out_mp4, lambda: _trailer_frames(data, offset, seconds, fps, size), size, fps
     )

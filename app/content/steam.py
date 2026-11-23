@@ -60,7 +60,12 @@ MAX_PLAYLIST_PIECES = 2000
 MAX_TRAILER_SECONDS = 3600
 # How many Steam apps of one game and how many movies of one app a slot tries before it gives up.
 MAX_APPS_TRIED = 3
-MAX_MOVIES_TRIED = 6
+MAX_MOVIES_TRIED = 12  # across all the game's apps
+# A playlist or piece that fails this many movies in a row, with no success between, turns Steam off
+# for the run like an `appdetails` outage does; one failing object is only that movie failing.
+CDN_FAILURES_BEFORE_OFF = 3
+# Real trailer URLs are well under this; a longer one is data to refuse, not to fetch.
+MAX_URL_LENGTH = 2048
 
 # What the builder stores in step 6's `source_image_ids` (a column of 32-character strings): a
 # prefix no IGDB image id can have, then the Steam app id, the movie id and the start in seconds.
@@ -116,6 +121,8 @@ def is_marker(image_id: str) -> bool:
 
 def checked_url(url: str) -> str | None:
     """`url` when it is a plain https URL on a trailer host with no credentials, else `None`."""
+    if len(url) > MAX_URL_LENGTH:
+        return None
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -130,6 +137,15 @@ def checked_url(url: str) -> str | None:
         and not any(ord(char) < 33 or ord(char) == 127 for char in url)
     )
     return url if ok else None
+
+
+def joined_url(base_url: str, uri: str) -> str | None:
+    """`uri` resolved against `base_url` and checked (`checked_url`), or `None`. `urljoin` raises a
+    plain `ValueError` on some malformed input (`//[x/y`), which is a refused URL, not a crash."""
+    try:
+        return checked_url(urljoin(base_url, uri))
+    except ValueError:
+        return None
 
 
 class _Record(BaseModel):
@@ -211,7 +227,7 @@ def parse_master(text: str, base_url: str) -> list[Variant]:
         uri = next((later for later in lines[number + 1 :] if later.strip()), "")
         if resolution is None or uri.startswith("#"):
             continue
-        url = checked_url(urljoin(base_url, uri.strip()))
+        url = joined_url(base_url, uri.strip())
         width, height = int(resolution.group(1)), int(resolution.group(2))
         if url is not None and width > 0 and height > 0:
             variants.append(Variant(width, height, url))
@@ -232,7 +248,7 @@ def choose_variant(variants: Sequence[Variant]) -> Variant | None:
 def parse_playlist(text: str, base_url: str) -> Playlist:
     """A variant (media) playlist of fMP4 pieces: one `#EXT-X-MAP` init segment and one URI per
     `#EXTINF`, ending with `#EXT-X-ENDLIST`. Byte ranges, encryption and a live playlist are not
-    supported and raise `PlaylistError`."""
+    supported and raise `PlaylistError`, and so does a second, different init segment."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines or lines[0] != "#EXTM3U" or "#EXT-X-ENDLIST" not in lines:
         raise PlaylistError("not a finished media playlist")
@@ -247,9 +263,14 @@ def parse_playlist(text: str, base_url: str) -> Playlist:
             raise PlaylistError("byte ranges and encryption are not supported")
         if line.startswith("#EXT-X-MAP"):
             match = _MAP_URI.search(line)
-            init_url = None if match is None else checked_url(urljoin(base_url, match.group(1)))
-            if init_url is None:
+            map_url = None if match is None else joined_url(base_url, match.group(1))
+            if map_url is None:
                 raise PlaylistError("the init segment is not a trailer URL")
+            if "BYTERANGE" in line:
+                raise PlaylistError("an init segment with a byte range is not supported")
+            if init_url is not None and init_url != map_url:
+                raise PlaylistError("the playlist has two different init segments")
+            init_url = map_url
         elif line.startswith("#EXTINF:"):
             try:
                 duration = float(line[len("#EXTINF:") :].split(",")[0])
@@ -258,7 +279,7 @@ def parse_playlist(text: str, base_url: str) -> Playlist:
             if not 0 < duration <= 60:
                 raise PlaylistError("a piece has an odd duration")
         elif not line.startswith("#"):
-            url = checked_url(urljoin(base_url, line))
+            url = joined_url(base_url, line)
             if url is None or duration is None:
                 raise PlaylistError("a piece is not a trailer URL or has no duration")
             pieces.append(Piece(url, clock, duration))
@@ -304,12 +325,10 @@ def pieces_for(playlist: Playlist, start: int, seconds: int) -> tuple[list[Piece
     raise PlaylistError("the playlist does not cover the clip")
 
 
-def movie_order(
-    movies: Sequence[SteamMovie], used: Collection[int], stream: random.Random
-) -> list[SteamMovie]:
-    """Every movie once, in an order drawn from `stream`, the ones no rejected draft used first."""
-    drawn = draw_distinct(stream, list(movies), len(movies))
-    return [m for m in drawn if m.id not in used] + [m for m in drawn if m.id in used]
+def draw_order(movies: Sequence[SteamMovie], stream: random.Random) -> list[SteamMovie]:
+    """Every movie once, in an order drawn from `stream` (lowest ids first before the draw, so the
+    order does not depend on what Steam happened to list first)."""
+    return draw_distinct(stream, sorted(movies, key=lambda movie: movie.id), len(movies))
 
 
 @dataclass(frozen=True)
@@ -331,9 +350,11 @@ class TrailerSource(Protocol):
 
 class SteamClient:
     """Reads Steam's trailers through the allow-listed client (`fetch.py`). The clock and the sleep
-    are injected, so a test needs no real time. After Steam is unavailable (429 or 5xx through every
-    retry) the client answers `STEAM_UNAVAILABLE` at once for the rest of the run instead of
-    waiting through the retries again for every slot."""
+    are injected, so a test needs no real time. After the store is unavailable (`appdetails` gives 429
+    or 5xx through every retry), or after `CDN_FAILURES_BEFORE_OFF` movies in a row fail on the
+    trailer host, the client answers `STEAM_UNAVAILABLE` at once for the rest of the run instead of
+    waiting through the retries again for every slot. One failing playlist or piece is only that
+    movie failing: the game's other movies are tried."""
 
     def __init__(
         self,
@@ -346,6 +367,7 @@ class SteamClient:
         self._sleep = sleep
         self._spacer = RequestSpacer(APPDETAILS_INTERVAL_SECONDS, clock=clock, sleep=sleep)
         self.is_unavailable = False
+        self._cdn_failures = 0
 
     async def __aenter__(self) -> Self:
         return self
@@ -356,39 +378,78 @@ class SteamClient:
     async def find(
         self, app_ids: Sequence[int], *, avoid: Collection[str], stream: random.Random, seconds: int
     ) -> Trailer:
-        if self.is_unavailable:
-            raise NoTrailer(FallbackReason.STEAM_UNAVAILABLE)
+        """A trailer segment of one of the game's apps. Every movie no rejected draft used is tried
+        first, across all the apps (each app in turn, its movies in drawn order), then new segments
+        of the movies that were used. `NoTrailer` with the last reason when none works."""
         if not app_ids:
             raise NoTrailer(FallbackReason.NO_STEAM_ID)
+        if self.is_unavailable:
+            raise NoTrailer(FallbackReason.STEAM_UNAVAILABLE)
         rejected = [m for m in map(TrailerMarker.parse, avoid) if m is not None]
+        used = {(m.app_id, m.movie_id) for m in rejected}
         reason = FallbackReason.NO_TRAILER
+        tries = 0
+        used_movies: list[tuple[int, SteamMovie]] = []
+        candidates: list[tuple[int, SteamMovie]] = []
         for app_id in app_ids[:MAX_APPS_TRIED]:
             try:
-                movies = await self._movies(app_id)
-                used = {m.movie_id for m in rejected if m.app_id == app_id}
-                for movie in movie_order(movies, used, stream)[:MAX_MOVIES_TRIED]:
-                    previous = [
-                        m.start for m in rejected if (m.app_id, m.movie_id) == (app_id, movie.id)
-                    ]
-                    try:
-                        return await self._trailer(app_id, movie, previous, stream, seconds)
-                    except NoTrailer as error:
-                        reason = error.reason
-                        if error.reason is FallbackReason.STEAM_UNAVAILABLE:
-                            raise
+                movies = draw_order(await self._movies(app_id), stream)
             except NoTrailer as error:
                 reason = error.reason
                 if error.reason is FallbackReason.STEAM_UNAVAILABLE:
                     self.is_unavailable = True
                     raise
+                continue
+            candidates += [(app_id, m) for m in movies if (app_id, m.id) not in used]
+            used_movies += [(app_id, m) for m in movies if (app_id, m.id) in used]
+            # This app's unused movies now; the used ones wait until every app has had its turn.
+            while candidates and tries < MAX_MOVIES_TRIED:
+                app, movie = candidates.pop(0)
+                tries += 1
+                try:
+                    return await self._attempt(app, movie, rejected, stream, seconds)
+                except NoTrailer as error:
+                    reason = error.reason
+                    if self.is_unavailable:
+                        raise
+        for app, movie in used_movies[: max(0, MAX_MOVIES_TRIED - tries)]:
+            try:
+                return await self._attempt(app, movie, rejected, stream, seconds)
+            except NoTrailer as error:
+                reason = error.reason
+                if self.is_unavailable:
+                    raise
         raise NoTrailer(reason)
+
+    async def _attempt(
+        self,
+        app_id: int,
+        movie: SteamMovie,
+        rejected: Sequence[TrailerMarker],
+        stream: random.Random,
+        seconds: int,
+    ) -> Trailer:
+        """One movie. A failure on the trailer host is that movie failing; only
+        `CDN_FAILURES_BEFORE_OFF` of them in a row turn Steam off for the run."""
+        previous = [m.start for m in rejected if (m.app_id, m.movie_id) == (app_id, movie.id)]
+        try:
+            trailer = await self._trailer(app_id, movie, previous, stream, seconds)
+        except NoTrailer as error:
+            if error.reason is FallbackReason.STEAM_UNAVAILABLE:
+                self._cdn_failures += 1
+                if self._cdn_failures >= CDN_FAILURES_BEFORE_OFF:
+                    self.is_unavailable = True
+                    raise
+            raise
+        self._cdn_failures = 0
+        return trailer
 
     async def _movies(self, app_id: int) -> list[SteamMovie]:
         url = f"{STORE_URL}?appids={app_id}&cc=us&l=en"
         body = await self._get(url, MAX_APPDETAILS_BYTES, spaced=True)
         try:
             payload = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):  # not JSON, or nested too deeply for the parser
             raise NoTrailer(FallbackReason.UNREADABLE) from None
         return parse_movies(payload, app_id)
 
@@ -401,10 +462,10 @@ class SteamClient:
         seconds: int,
     ) -> Trailer:
         master = await self._text(movie.hls_h264)
-        variant = choose_variant(parse_master(master, movie.hls_h264))
-        if variant is None:
-            raise NoTrailer(FallbackReason.UNREADABLE)
         try:
+            variant = choose_variant(parse_master(master, movie.hls_h264))
+            if variant is None:
+                raise NoTrailer(FallbackReason.UNREADABLE)
             playlist = parse_playlist(await self._text(variant.url), variant.url)
             starts = unused_starts(candidate_starts(playlist.total, seconds), seconds, previous)
             if not starts:
@@ -447,7 +508,7 @@ class SteamClient:
                 )
             except httpx.RequestError:
                 pass  # A timeout or a refused connection: retried like a 5xx.
-            except FetchError:
+            except (FetchError, httpx.InvalidURL):
                 raise NoTrailer(FallbackReason.UNREADABLE) from None
             else:
                 status = response.status_code
