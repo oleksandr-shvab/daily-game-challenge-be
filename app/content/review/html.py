@@ -7,6 +7,8 @@ import html as stdlib_html
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from app.content.steam import TrailerMarker
+
 STYLESHEET_PATH = "/review.css"
 FILES_PATH = "/files"
 
@@ -23,10 +25,11 @@ CHECKLIST = (
     "Step 1 is readable but hard",
     "No clue shows the game's name, logo or a character name",
     "The hints are correct",
-    "The clip plays (it may reuse the stills when the game has few screenshots)",
+    "The clip plays, shows gameplay and no title, logo or game name (a slideshow only has to play)",
 )
 
-CLIP_FROM_STILLS = " · Clip made from the stills (decision 74)"
+CLIP_FROM_STILLS = " · Slideshow of the stills (decision 74)"
+CLIP_SLIDESHOW = " · Slideshow of screenshots"
 NO_REBUILD_NOTE = "This game has too few screenshots to rebuild; reject as Never"
 
 # One screen at 1280 by 800 (AC-54): the six steps as a grid on the left, the answer and the
@@ -139,7 +142,8 @@ class DraftView:
     clues: list[ClueView]
     queue_size: int
     can_rebuild: bool = True  # False: the game has too few screenshots (decision 74)
-    clip_from_stills: bool = False  # step 6 reuses steps 2 to 5's screenshots
+    clip_from_stills: bool = False  # a slideshow that reuses steps 2 to 5's screenshots
+    clip_trailer: TrailerMarker | None = None  # step 6 is cut from this Steam trailer segment
 
 
 def _file_url(file: FileView) -> str:
@@ -181,10 +185,22 @@ def _clue_caption(clue: ClueView) -> str:
     return " · ".join(parts)
 
 
+def _clip_label(draft: DraftView) -> str:
+    """What step 6 is, for its caption (AC-38): a Steam trailer, with the segment's start so the
+    reviewer can find it, or a slideshow. The numbers are ours (parsed digits), not Steam text."""
+    if draft.clip_trailer is not None:
+        marker = draft.clip_trailer
+        return (
+            f" · Steam trailer (app {esc(marker.app_id)}, movie {esc(marker.movie_id)},"
+            f" from {esc(marker.start)} s)"
+        )
+    return CLIP_FROM_STILLS if draft.clip_from_stills else CLIP_SLIDESHOW
+
+
 def draft_page(draft: DraftView, token: str) -> str:
     figures = "".join(
         f"<figure>{_clue_media(clue)}<figcaption>{_clue_caption(clue)}"
-        f"{CLIP_FROM_STILLS if clue.step == 6 and draft.clip_from_stills else ''}"
+        f"{_clip_label(draft) if clue.step == 6 else ''}"
         "</figcaption></figure>"
         for clue in draft.clues
     )

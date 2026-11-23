@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.candidates import OWN_CLIP_SCREENSHOTS
+from app.content.steam import TrailerMarker, is_marker
 from app.crud.exclusion import add_exclusion, give_up_rebuild, list_exclusions
 from app.crud.puzzle import (
     delete_puzzle,
@@ -58,12 +59,27 @@ def can_rebuild(image_ids: Iterable[str]) -> bool:
     """Whether a rebuild of a draft that used these screenshots could ever build. A draft uses 5
     from a pool of 5 or 6 and at least 7 from a larger one, so fewer than 7 different ids means the
     pool was too small. A larger pool can still run out (7 to 11): the builder reports
-    `cannot_rebuild` then, and `--give-up` frees the slot."""
-    return len(set(image_ids)) >= OWN_CLIP_SCREENSHOTS
+    `cannot_rebuild` then, and `--give-up` frees the slot. A trailer's marker (`steam:...`) is not a
+    screenshot and is not counted; a trailer draft still lists the screenshots the plan set aside
+    for its slideshow (`clue_inputs`), so the count is the same as for a slideshow draft."""
+    return len({image_id for image_id in image_ids if not is_marker(image_id)}) >= (
+        OWN_CLIP_SCREENSHOTS
+    )
+
+
+def clip_trailer(per_step: Mapping[int, Sequence[str]]) -> TrailerMarker | None:
+    """The Steam trailer segment step 6 was cut from, or `None` for a slideshow (decision 75)."""
+    for image_id in per_step.get(6, ()):
+        marker = TrailerMarker.parse(image_id)
+        if marker is not None:
+            return marker
+    return None
 
 
 def clip_is_from_stills(per_step: Mapping[int, Sequence[str]]) -> bool:
-    """True when every screenshot of step 6 is also one of steps 2 to 5 (decision 74)."""
+    """True for a slideshow whose every screenshot is also one of steps 2 to 5 (decision 74)."""
+    if clip_trailer(per_step) is not None:
+        return False
     clip = set(per_step.get(6, ()))
     stills = {image_id for step in (2, 3, 4, 5) for image_id in per_step.get(step, ())}
     return bool(clip) and clip <= stills
