@@ -10,7 +10,19 @@ from typing import Any
 
 import httpx
 
-ALLOWED_HOSTS = frozenset({"api.igdb.com", "id.twitch.tv", "images.igdb.com"})
+# IGDB's API, its token service and its image host, then Steam's store data host and the host that
+# serves the trailers (decision 75). A trailer's playlists and pieces were checked on 2026-11-23 and
+# all sit on `video.akamai.steamstatic.com`; no redirect is followed, so a playlist that points
+# anywhere else is refused, not chased.
+ALLOWED_HOSTS = frozenset(
+    {
+        "api.igdb.com",
+        "id.twitch.tv",
+        "images.igdb.com",
+        "store.steampowered.com",
+        "video.akamai.steamstatic.com",
+    }
+)
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_BODY_BYTES = 20 * 1024 * 1024
 
