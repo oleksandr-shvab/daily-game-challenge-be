@@ -15,6 +15,8 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
+from app.content import media
+from app.content.builder import GENERATOR_VERSION
 from app.content.candidates import choose_answer
 from app.content.igdb import IgdbGame, parse_game
 from app.content.seed import (
@@ -175,7 +177,16 @@ def test__slot_seed__one_salt_repeats_and_another_salt_chooses_otherwise() -> No
     assert isinstance(seed.stream(Purpose.CLIP), random.Random)
 
 
-GOLDEN_ANSWERS = [16, 39, 14, 33, 27, 9, 6, 32, 5, 8]
+# Owner decision 75 (2026-11-23) raised the builder's GENERATOR_VERSION from "1" to "2": the version
+# is part of every seed, so every slot draws other numbers, and the crop stream now draws the cuts'
+# placements and the clip stream the trailer. The goldens below are the draws of a version "2" seed
+# (the version "1" answers were [16, 39, 14, 33, 27, 9, 6, 32, 5, 8]). The test ties them to the
+# builder's version, so raising it again means redoing the goldens on purpose.
+GOLDEN_VERSION = "2"
+GOLDEN_ANSWERS = [45, 47, 6, 20, 30, 1, 19, 31, 5, 10]
+# The cuts' placements of slot 1: (distance from the centre in image widths, vertical position)
+# for steps 1 to 4, from the `crop` stream.
+GOLDEN_CUTS = [(-0.324, 0.5653), (-0.1812, 0.6669), (-0.0903, 0.4581), (-0.0137, 0.1004)]
 GOLDEN_INDEXES = [7, 8, 4, 4, 4, 7, 7, 7]
 GOLDEN_DISTINCT = ["h", "i", "d", "c"]
 
@@ -183,12 +194,17 @@ GOLDEN_DISTINCT = ["h", "i", "d", "c"]
 def test__draws__give_the_same_numbers_on_every_python_version() -> None:
     """A golden test: the draws use only `random()`, so these ids hold on any Python. If this goes
     red, the choice logic changed: raise the builder's GENERATOR_VERSION."""
+    assert GENERATOR_VERSION == GOLDEN_VERSION
     candidates = games(50)
     chosen = [
-        choose_answer(candidates, seed_of(TEST_SALT, slot).stream(Purpose.ANSWER)).id
+        choose_answer(
+            candidates, seed_of(TEST_SALT, slot, version=GOLDEN_VERSION).stream(Purpose.ANSWER)
+        ).id
         for slot in range(1, 11)
     ]
     assert chosen == GOLDEN_ANSWERS
+    cuts = media.cut_placements(seed_of(TEST_SALT, 1, version=GOLDEN_VERSION).stream(Purpose.CROP))
+    assert [(round(c.dx, 4), round(c.dy, 4)) for c in cuts] == GOLDEN_CUTS
     stream = seed_of(TEST_SALT, 1).stream(Purpose.SCREENSHOTS)
     assert [draw_index(stream, 10) for _ in range(8)] == GOLDEN_INDEXES
     stream = seed_of(TEST_SALT, 1).stream(Purpose.SCREENSHOTS)

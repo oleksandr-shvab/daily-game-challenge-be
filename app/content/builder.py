@@ -3,7 +3,8 @@
 For each slot, in ascending order: choose the answer and the screenshots from the seed (a rebuild
 forces its excluded title and leaves out the screenshots of every rejected draft of the slot), fetch
 the screenshots from IGDB's image host through the allow-listed client, make the six clues' files
-with `app/content/media.py`, then store the files under their SHA-256 and write the draft whole or
+with `app/content/media.py` (steps 1 to 5 are clear cuts that grow; step 6 is 12 seconds of the
+game's Steam trailer, or a slideshow of screenshots when there is none, owner decision 75), then store the files under their SHA-256 and write the draft whole or
 not at all: one transaction with the title (when the list does not hold it yet), the puzzle in
 `in_review` with no date, six clues and their media rows measured from the files. The files go
 first, so a failed write leaves files and no row (non-goal: clean-up). A slot that already has a
@@ -25,6 +26,7 @@ import datetime as dt
 import json
 import re
 import shutil
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -56,6 +58,7 @@ from app.content.igdb import MAX_RETRIES, IgdbGame, retry_delay
 from app.content.media import MediaFacts, MediaLimitError
 from app.content.seed import Purpose, SlotSeed, check_salt, reserved_secrets
 from app.content.settings import ContentSettings
+from app.content.steam import FallbackReason, NoTrailer, Trailer, TrailerMarker, TrailerSource
 from app.content.target import check_image_gate
 from app.content.titles_import import ImportRecord, to_record
 from app.core.clock import utc_today
@@ -80,7 +83,9 @@ from app.models.title import TitleKind
 # Raise this whenever the draw algorithm or its order changes (R-8): the same inputs must then give
 # other choices. Funnel thresholds and candidate data (settings, a new IGDB import) are not covered.
 # The golden tests of `tests/test_content_seed.py` and `tests/test_candidates.py` go red first.
-GENERATOR_VERSION = "1"
+# "2" (decision 75): the crop stream now draws the cuts' placements and the clip stream the trailer
+# and its start, so a slot draws other answers and other pictures than under "1".
+GENERATOR_VERSION = "2"
 
 # IGDB's image host, the size the clues are made from (`t_1080p`).
 IMAGE_URL = "https://images.igdb.com/igdb/image/upload/t_1080p/{image_id}.jpg"
@@ -214,6 +219,27 @@ class SlotStatus(StrEnum):
     FAILED = "failed"
 
 
+class ClipKind(StrEnum):
+    TRAILER = "trailer"
+    SLIDESHOW = "slideshow"
+
+
+@dataclass(frozen=True)
+class ClipChoice:
+    """How a slot's step-6 clip was made: from a segment of a Steam trailer (`marker`), or as a
+    slideshow, with the reason there was no trailer (`fallback`)."""
+
+    kind: ClipKind
+    marker: TrailerMarker | None = None
+    fallback: FallbackReason | None = None
+
+    def describe(self) -> str:
+        """For the report: no name, no URL, no id of the trailer."""
+        if self.kind == ClipKind.TRAILER:
+            return "Steam trailer"
+        return f"slideshow ({self.fallback})" if self.fallback else "slideshow"
+
+
 @dataclass(frozen=True)
 class FilePlan:
     step: int
@@ -231,6 +257,7 @@ class SlotOutcome:
     files: list[FilePlan] = field(default_factory=list)
     hint_steps: list[int] = field(default_factory=list)
     near_duplicates: int = 0
+    clip: ClipChoice | None = None
 
 
 @dataclass
@@ -253,6 +280,18 @@ class BuildReport:
     @property
     def is_ok(self) -> bool:
         return all(outcome.status != SlotStatus.FAILED for outcome in self.outcomes)
+
+    @property
+    def clips(self) -> Counter[str]:
+        """How the step-6 clips of the slots built or planned were made: `trailer` or `slideshow`."""
+        return Counter(o.clip.kind for o in self.outcomes if o.clip is not None)
+
+    @property
+    def fallbacks(self) -> Counter[FallbackReason]:
+        """Why slideshows were made. `steam_unavailable` is a Steam outage that did not stop the run."""
+        return Counter(
+            o.clip.fallback for o in self.outcomes if o.clip is not None and o.clip.fallback
+        )
 
     def lines(self, *, show_answers: bool = False) -> list[str]:
         """What the script prints. The answer's name only with `show_answers` (AC-45, AC-83), and
@@ -285,6 +324,8 @@ class BuildReport:
                     lines.append(
                         f"  step {plan.step} {plan.role}: {facts.content_type}, {size}{duration}"
                     )
+                if outcome.clip is not None:
+                    lines.append(f"  step 6 clip: {outcome.clip.describe()}")
                 if show_answers and outcome.answer_name is not None:
                     lines.append(f"  answer: {json.dumps(outcome.answer_name)}")
             if outcome.near_duplicates:
@@ -294,6 +335,21 @@ class BuildReport:
                 )
         counts = {status: sum(o.status == status for o in self.outcomes) for status in SlotStatus}
         lines.append(", ".join(f"{status}: {count}" for status, count in counts.items() if count))
+        if self.clips:
+            lines.append(
+                "clips: "
+                + ", ".join(f"{kind} {count}" for kind, count in sorted(self.clips.items()))
+                + "; slideshows because: "
+                + (
+                    ", ".join(f"{why} {n}" for why, n in sorted(self.fallbacks.items()))
+                    or "nothing"
+                )
+            )
+        if self.fallbacks[FallbackReason.STEAM_UNAVAILABLE]:
+            lines.append(
+                f"Steam was unavailable for {self.fallbacks[FallbackReason.STEAM_UNAVAILABLE]}"
+                " slot(s): their clips are slideshows"
+            )
         return lines
 
 
@@ -357,48 +413,78 @@ class SlotPlan:
     title_id: int | None  # None: the answer is not in the title list yet
     record: ImportRecord | None  # what a new title is made from
     is_rebuild: bool
+    avoid: frozenset[str]  # screenshot ids and trailer markers of the slot's rejected drafts
 
 
-def make_files(
+def make_still_files(
     shots: ScreenshotPlan, raw: dict[str, Path], seed: SlotSeed, out_dir: Path
 ) -> list[BuiltFile]:
-    """The six clues' files, in step order: the step-1 crop, the four stills, the clip and its
-    poster. Sync and CPU-bound, so the caller runs it in a thread. Each function measures its file
-    and refuses one that breaks a limit (AC-39)."""
+    """The files of steps 1 to 5, in step order: four clear cuts that grow and the whole fifth
+    screenshot (AC-34, decision 75). The placements of the cuts come from the `crop` stream. Sync
+    and CPU-bound, so the caller runs it in a thread. Each function measures its file and refuses
+    one that breaks a limit (AC-39). The folder is emptied first."""
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
+    placements = media.cut_placements(seed.stream(Purpose.CROP))
     built: list[BuiltFile] = []
-
-    def add(step: int, role: str, path: Path, facts: MediaFacts) -> None:
-        built.append(BuiltFile(step, role, path, sha256_file(path), facts))
-
-    path = out_dir / "step1.webp"
-    add(
-        1,
-        ClueRole.SOURCE,
-        path,
-        media.pixelated_crop(raw[shots.crop.image_id], path, seed.stream(Purpose.CROP)),
-    )
-    for step, shot in enumerate(shots.steps, start=2):
+    sources = [shots.crop, *shots.steps]
+    for step, shot in enumerate(sources, start=1):
         path = out_dir / f"step{step}.webp"
-        add(step, ClueRole.SOURCE, path, media.still(raw[shot.image_id], path))
-    clip_path = out_dir / "step6.mp4"
-    sources = [raw[shot.image_id] for shot in shots.clip]
-    add(6, ClueRole.SOURCE, clip_path, media.clip(sources, clip_path, seed.stream(Purpose.CLIP)))
-    poster_path = out_dir / "step6-poster.webp"
-    add(6, ClueRole.POSTER, poster_path, media.poster(clip_path, poster_path))
+        if step < len(sources):
+            facts = media.cut(raw[shot.image_id], path, step, placements[step - 1])
+        else:
+            facts = media.still(raw[shot.image_id], path)
+        built.append(BuiltFile(step, ClueRole.SOURCE, path, sha256_file(path), facts))
     return built
 
 
-def clue_inputs(plan: SlotPlan, files: Sequence[BuiltFile]) -> list[ClueInput]:
+def _clip_files(clip_path: Path, clip_facts: MediaFacts) -> list[BuiltFile]:
+    poster_path = clip_path.with_name("step6-poster.webp")
+    poster_facts = media.poster(clip_path, poster_path)
+    return [
+        BuiltFile(6, ClueRole.SOURCE, clip_path, sha256_file(clip_path), clip_facts),
+        BuiltFile(6, ClueRole.POSTER, poster_path, sha256_file(poster_path), poster_facts),
+    ]
+
+
+def make_slideshow_files(
+    shots: ScreenshotPlan, raw: dict[str, Path], seed: SlotSeed, out_dir: Path
+) -> list[BuiltFile]:
+    """Step 6, the fallback: the slideshow of the plan's clip screenshots and its poster."""
+    clip_path = out_dir / "step6.mp4"
+    sources = [raw[shot.image_id] for shot in shots.clip]
+    facts = media.clip(sources, clip_path, seed.stream(Purpose.CLIP))
+    return _clip_files(clip_path, facts)
+
+
+def make_trailer_files(trailer: Trailer, out_dir: Path) -> list[BuiltFile]:
+    """Step 6: the chosen segment of a Steam trailer, re-encoded, and its poster (the clip's first
+    decoded frame, AC-40). A file left by a failed attempt is removed."""
+    clip_path = out_dir / "step6.mp4"
+    try:
+        facts = media.trailer_clip(trailer.data, clip_path, offset=trailer.offset)
+        return _clip_files(clip_path, facts)
+    except BaseException:
+        for name in ("step6.mp4", "step6-poster.webp"):
+            (out_dir / name).unlink(missing_ok=True)
+        raise
+
+
+def clue_inputs(
+    plan: SlotPlan, files: Sequence[BuiltFile], clip: ClipChoice | None = None
+) -> list[ClueInput]:
     """The clue rows. `source_image_ids` follow the step order: step 1 the crop's screenshot,
-    steps 2 to 5 their own, step 6 the clip's screenshots in clip order."""
+    steps 2 to 5 their own, step 6 the clip's screenshots in clip order. A trailer's step 6 starts
+    with its marker (`steam:<app>:<movie>:<start>`, `app/content/steam.py`) and still lists the
+    screenshots the plan set aside for the slideshow: the draft was allotted them, so a rebuild
+    leaves them out too and the review page's "enough screenshots to rebuild" count is unchanged."""
     hint_of = hints(plan.game)
     url = source_url(plan.game)
+    marker = [str(clip.marker)] if clip is not None and clip.marker is not None else []
     image_ids = {
         1: [plan.shots.crop.image_id],
         **{step: [shot.image_id] for step, shot in enumerate(plan.shots.steps, start=2)},
-        6: [shot.image_id for shot in plan.shots.clip],
+        6: [*marker, *(shot.image_id for shot in plan.shots.clip)],
     }
     clues = []
     for step in range(1, STEPS + 1):
@@ -487,6 +573,7 @@ class Builder:
         fetch_image: FetchImage,
         writer: MediaWriter | None,
         dry_run: bool = False,
+        trailers: TrailerSource | None = None,
     ) -> None:
         if writer is None and not dry_run:
             raise ValueError("a run that writes needs a media writer")
@@ -498,6 +585,7 @@ class Builder:
         self.today = utc_today(now)
         self.games = games
         self.fetch_image = fetch_image
+        self.trailers = trailers
         self.writer = writer
         self.dry_run = dry_run
         # Set by `run`, which owns the game's rows.
@@ -623,9 +711,9 @@ class Builder:
             plan = await self._plan(slot, pool)
             # The planning reads are over: no transaction stays open through the fetches and encodes.
             await self.db.rollback()
-            files = await self._make_files(plan)
+            files, clip = await self._make_files(plan)
             # The media rule is checked for a dry run too, before anything is written (AC-13b).
-            clues = clue_inputs(plan, files)
+            clues = clue_inputs(plan, files, clip)
             problem = layout_problem(clues)
             if problem is not None:
                 raise SlotError("media_layout", problem)
@@ -644,6 +732,7 @@ class Builder:
             files=[FilePlan(file.step, file.role, file.facts) for file in files],
             hint_steps=[step for step, hint in hints(plan.game).items() if hint is not None],
             near_duplicates=self.near_duplicates,
+            clip=clip,
         )
         if not self.dry_run:
             await self._write(plan, files, clues)
@@ -681,7 +770,7 @@ class Builder:
         shots = assign_screenshots(
             game, seed.stream(Purpose.SCREENSHOTS), avoid, settings=self.settings
         )
-        return SlotPlan(slot, game, shots, title_id, record, bool(own_rows))
+        return SlotPlan(slot, game, shots, title_id, record, bool(own_rows), frozenset(avoid))
 
     def _forced(
         self, rows: list[ExclusionRow], candidates: Sequence[IgdbGame]
@@ -729,10 +818,43 @@ class Builder:
             await asyncio.to_thread(write_atomically, path, lambda out: out.write(data))
         return path
 
-    async def _make_files(self, plan: SlotPlan) -> list[BuiltFile]:
-        raw = {image_id: await self._raw_path(image_id) for image_id in plan.shots.image_ids}
+    async def _make_files(self, plan: SlotPlan) -> tuple[list[BuiltFile], ClipChoice]:
+        """Steps 1 to 5 first, then step 6: a Steam trailer when the game has a usable one, else
+        the slideshow (the screenshots it needs are fetched only then). A trailer that cannot be
+        read or made to fit the limits is a fallback too, not a failed slot."""
+        seed = self._seed(plan.slot)
         out_dir = self.settings.content_work_path / "out" / str(plan.slot)
-        return await asyncio.to_thread(make_files, plan.shots, raw, self._seed(plan.slot), out_dir)
+        raw = {
+            shot.image_id: await self._raw_path(shot.image_id)
+            for shot in (plan.shots.crop, *plan.shots.steps)
+        }
+        files = await asyncio.to_thread(make_still_files, plan.shots, raw, seed, out_dir)
+        fallback = FallbackReason.STEAM_OFF
+        if self.trailers is not None:
+            try:
+                trailer = await self.trailers.find(
+                    plan.game.steam_app_ids,
+                    avoid=plan.avoid,
+                    stream=seed.stream(Purpose.CLIP),
+                    seconds=media.CLIP_SECONDS,
+                )
+            except NoTrailer as error:
+                fallback = error.reason
+            else:
+                try:
+                    clip_files = await asyncio.to_thread(make_trailer_files, trailer, out_dir)
+                except (MediaLimitError, ValueError, FFmpegError) as error:
+                    fallback = (
+                        FallbackReason.OVER_LIMIT
+                        if isinstance(error, MediaLimitError)
+                        else FallbackReason.UNREADABLE
+                    )
+                else:
+                    return files + clip_files, ClipChoice(ClipKind.TRAILER, trailer.marker)
+        for shot in plan.shots.clip:
+            raw[shot.image_id] = await self._raw_path(shot.image_id)
+        slideshow = await asyncio.to_thread(make_slideshow_files, plan.shots, raw, seed, out_dir)
+        return files + slideshow, ClipChoice(ClipKind.SLIDESHOW, fallback=fallback)
 
     async def _put(self, file: BuiltFile) -> None:
         """Store one file. A storage `OSError` is named a `MediaWriteError` here, before it can be

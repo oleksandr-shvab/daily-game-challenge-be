@@ -1,6 +1,7 @@
-"""Clue media of the puzzle builder (SPEC-04 AC-34 to AC-40): the limits table, the stills and the
-step-1 crop, the clip and its poster, and the seed's part in each. Images are generated here, no
-network. Clips are small (640x360 at the real 24 fps and 12 s) to keep the run short."""
+"""Clue media of the puzzle builder (SPEC-04 AC-34 to AC-40, decision 75): the limits table, the
+stills and the growing clear cuts, the slideshow and trailer clips and the poster, and the seed's
+part in each. Images and videos are generated here, no network. Slideshow clips are small (640x360
+at the real 24 fps and 12 s) to keep the run short."""
 
 import random
 from itertools import pairwise
@@ -26,6 +27,21 @@ def blobs(seed: int, size: tuple[int, int], noise: float = 0.0) -> Image.Image:
         grain = Image.frombytes("RGB", size, rng.randbytes(size[0] * size[1] * 3))
         image = Image.blend(image, grain, noise)
     return image
+
+
+def striped(seed: int, size: tuple[int, int]) -> Image.Image:
+    """Blobs with a fine 4 px checker on top: lossy WebP keeps it, any averaging into blocks of
+    about 20 px flattens it."""
+    cells = (size[0] // 4 + 1, size[1] // 4 + 1)
+    checker = Image.frombytes(
+        "L",
+        cells,
+        bytes(90 if (x + y) % 2 else 0 for y in range(cells[1]) for x in range(cells[0])),
+    )
+    checker = checker.resize((cells[0] * 4, cells[1] * 4), Image.Resampling.NEAREST).crop(
+        (0, 0, *size)
+    )
+    return ImageChops.add(blobs(seed, size), Image.merge("RGB", (checker, checker, checker)))
 
 
 @pytest.fixture(scope="module")
@@ -112,47 +128,67 @@ def test__still__fits_the_limits_with_no_metadata_and_refuses_what_cannot_fit(
     assert not refused.exists()
 
 
-@pytest.mark.parametrize(
-    ("size", "crop_width"),
-    [
-        ((1280, 720), 427),
-        ((1920, 1080), 640),
-        ((1500, 1000), 500),
-        ((3000, 500), 889),  # Very wide and low: the height limits the window, not the third.
-    ],
-)
-def test__pixelated_crop__is_a_third_wide_inside_the_image_and_flat_in_blocks(
-    tmp_path: Path, size: tuple[int, int], crop_width: int
+def fitted(size: tuple[int, int]) -> tuple[int, int]:
+    """What `still` makes of a screenshot of `size`: within 1920x1080, never enlarged."""
+    scale = min(1.0, 1920 / size[0], 1080 / size[1])
+    return round(size[0] * scale), round(size[1] * scale)
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (1920, 1080), (1500, 1000), (3000, 500), (640, 360)])
+@pytest.mark.parametrize(("step", "fraction"), [(1, 0.25), (2, 0.35), (3, 0.5), (4, 0.7)])
+def test__cut__grows_with_the_step_keeps_the_aspect_and_its_own_pixels_with_no_pixelation(
+    tmp_path: Path, size: tuple[int, int], step: int, fraction: float
 ) -> None:
     source = tmp_path / "source.png"
-    blobs(5, size).save(source)
-    for seed in range(25):
-        left, top, right, bottom = media.crop_box(size, random.Random(seed))
-        assert 0 <= left < right <= size[0]
-        assert 0 <= top < bottom <= size[1]
-        assert right - left == crop_width
-        assert (right - left) / (bottom - top) == pytest.approx(16 / 9, abs=0.02)
+    striped(5, size).save(source)  # Fine detail: any averaging into blocks shows.
+    width, height = fitted(size)
+    placement = media.cut_placements(random.Random(3))[step - 1]
 
-    out = tmp_path / "crop.webp"
-    facts = media.pixelated_crop(source, out, random.Random(3))
+    facts = media.cut(source, tmp_path / "cut.webp", step, placement)
 
-    assert (facts.width, facts.height) == (960, 540)
-    with Image.open(out) as result:
-        picture = result.convert("RGB")
-    block = media.CROP_BLOCK_PX
-    colours = set()
-    for x in range(0, 960, block):
-        for y in range(0, 540, block):
-            block_pixels = picture.crop((x, y, x + block, y + block))
-            assert len(block_pixels.getcolors()) == 1  # One flat colour per block.
-            colours.add(block_pixels.getpixel((0, 0)))
-    assert len(colours) > 100  # A real picture, not a flat one.
-    # The first block is the average colour of its part of the crop the box names.
-    left, top, right, bottom = media.crop_box(size, random.Random(3))
+    # "About" the fraction of the width (AC-34), with the screenshot's own aspect ratio, and never
+    # larger than the screenshot: a small screenshot gives a small cut, nothing is enlarged.
+    assert facts.width == pytest.approx(width * fraction, abs=width * 0.01)
+    assert facts.height == pytest.approx(height * fraction, abs=height * 0.01)
+    assert facts.width <= width and facts.height <= height
+    assert facts == media.measure(tmp_path / "cut.webp")
+    # The cut is the screenshot's own pixels at the window the placement names, as it was drawn.
     with Image.open(source) as original:
-        part = original.crop((left, top, left + (right - left) // 48, top + (bottom - top) // 27))
-        expected = ImageStat.Stat(part.convert("RGB")).mean
-    assert all(abs(a - b) < 12 for a, b in zip(picture.getpixel((0, 0)), expected, strict=True))
+        fit = original.convert("RGB")
+        fit.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+    box = media.cut_box(fit.size, media.CUT_WIDTH_FRACTIONS[step - 1], placement)
+    with Image.open(tmp_path / "cut.webp") as result:
+        assert result.size == (box[2] - box[0], box[3] - box[1])
+        assert mean_difference(result, fit.crop(box)) < 6  # lossy WebP only; blocks would be 40
+
+
+@pytest.mark.parametrize("size", [(1920, 1080), (1280, 720), (1500, 1000), (3000, 500)])
+def test__cut_placements__step_1_sits_near_a_side_and_every_later_cut_is_closer_to_the_centre(
+    size: tuple[int, int],
+) -> None:
+    width, height = size
+    sides = set()
+    for seed in range(300):
+        placements = media.cut_placements(random.Random(seed))
+        boxes = [
+            media.cut_box(size, fraction, placement)
+            for fraction, placement in zip(media.CUT_WIDTH_FRACTIONS, placements, strict=False)
+        ]
+        distances = []
+        for (left, top, right, bottom), fraction in zip(
+            boxes, media.CUT_WIDTH_FRACTIONS, strict=False
+        ):
+            assert 0 <= left < right <= width and 0 <= top < bottom <= height  # always inside
+            assert (right - left) / (bottom - top) == pytest.approx(width / height, abs=0.05)
+            distances.append(abs((left + right) / 2 - width / 2))
+            if bottom - top < height * 0.85:  # a cut with room keeps clear of the HUD strips
+                assert top >= height * 0.05 and bottom <= height * 0.95
+        assert distances[0] >= width * 0.2  # Step 1: near a side, away from the centre.
+        assert all(near < far for far, near in pairwise(distances))  # then closer each step
+        signs = {left + right > width for left, _, right, _ in boxes[:3]}  # step 4 is at the centre
+        assert len(signs) == 1  # one side for the cuts
+        sides.add(signs.pop())
+    assert sides == {True, False}  # both sides occur
 
 
 def test__clip__is_a_silent_12_second_h264_mp4_and_the_poster_is_its_first_frame(
@@ -245,17 +281,9 @@ def test__measure__refuses_a_clip_with_an_audio_track(tmp_path: Path) -> None:
         media.measure(path)
 
 
-def test__seed__decides_the_crop_and_the_clip(tmp_path: Path, shots: list[Path]) -> None:
-    def crop(seed: int, name: str) -> bytes:
-        out = tmp_path / name
-        media.pixelated_crop(shots[0], out, random.Random(seed))
-        return out.read_bytes()
-
-    assert media.crop_box((1920, 1080), random.Random(9)) == media.crop_box(
-        (1920, 1080), random.Random(9)
-    )
-    assert crop(9, "a.webp") == crop(9, "b.webp")
-    assert crop(9, "a.webp") != crop(10, "c.webp")
+def test__seed__decides_the_cuts_and_the_slideshow(tmp_path: Path, shots: list[Path]) -> None:
+    assert media.cut_placements(random.Random(9)) == media.cut_placements(random.Random(9))
+    assert media.cut_placements(random.Random(9)) != media.cut_placements(random.Random(10))
 
     # The encoder is not asked to give identical bytes, so the clips are compared by their pictures.
     def clip_frame(seed: int, name: str) -> Image.Image:
@@ -267,3 +295,71 @@ def test__seed__decides_the_crop_and_the_clip(tmp_path: Path, shots: list[Path])
     other = mean_difference(clip_frame(4, "a.mp4"), clip_frame(5, "c.mp4"))
     assert same < 3
     assert other > 10
+
+
+def fake_trailer(
+    path: Path, seconds: int, *, fps: int = 10, size: tuple[int, int] = (320, 180), audio: bool
+) -> None:
+    """A trailer made up: second n is flat grey 15 * n, so a decoded frame names its second. With
+    `audio`, a silent AAC track next to the video, as a real trailer's stream may have."""
+    with av.open(str(path), "w", format="mp4") as container:
+        video = container.add_stream("libx264", rate=fps)
+        video.width, video.height, video.pix_fmt = (*size, "yuv420p")
+        track = container.add_stream("aac", rate=44100) if audio else None
+        for index in range(seconds * fps):
+            grey = 15 * (index // fps)
+            frame = av.VideoFrame.from_image(Image.new("RGB", size, (grey, grey, grey)))
+            frame.pts = index
+            container.mux(video.encode(frame))
+        container.mux(video.encode())
+        if track is not None:
+            silence = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+            for plane in silence.planes:
+                plane.update(bytes(plane.buffer_size))
+            silence.sample_rate = 44100
+            for index in range(seconds * 44100 // 1024):
+                silence.pts = index * 1024
+                container.mux(track.encode(silence))
+            container.mux(track.encode())
+
+
+def grey_of(image: Image.Image) -> float:
+    return ImageStat.Stat(image.convert("L")).mean[0]
+
+
+def test__trailer_clip__is_the_asked_segment_as_a_silent_h264_mp4_and_refuses_a_short_one(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "trailer.mp4"
+    fake_trailer(source, 16, audio=True)
+    data = source.read_bytes()
+    with av.open(str(source)) as container:
+        assert container.streams.audio  # the source has sound; the clip must not
+
+    out = tmp_path / "clip.mp4"
+    facts = media.trailer_clip(data, out, offset=3.0, fps=10, seconds=8)
+
+    assert facts == media.measure(out)
+    assert media.broken_limits(facts) == []
+    assert (facts.width, facts.height) == (320, 180)  # the trailer's own size, not enlarged
+    assert abs(facts.duration_ms - 8_000) < 100
+    with av.open(str(out)) as container:
+        assert len(container.streams) == 1 and not container.streams.audio  # no audio (AC-36)
+        assert container.streams.video[0].codec_context.name == "h264"
+        pictures = [frame.to_image() for frame in container.decode(video=0)]
+    assert len(pictures) == 8 * 10
+    # Seconds 3 to 11 of the trailer: grey 45 first, 90 after 3.9 s (second 6), 150 at the end.
+    assert grey_of(pictures[0]) == pytest.approx(45, abs=8)
+    assert grey_of(pictures[39]) == pytest.approx(90, abs=8)
+    assert grey_of(pictures[79]) == pytest.approx(150, abs=8)
+    data_out = out.read_bytes()
+    assert data_out.index(b"moov") < data_out.index(b"mdat")  # +faststart
+    poster_out = tmp_path / "poster.webp"
+    media.poster(out, poster_out)
+    with Image.open(poster_out) as poster_image:
+        assert grey_of(poster_image) == pytest.approx(45, abs=8)  # the clip's first frame (AC-40)
+
+    # Data that ends before the clip does is refused, and no file is left.
+    with pytest.raises(MediaLimitError):
+        media.trailer_clip(data, tmp_path / "short.mp4", offset=12.0, fps=10, seconds=8)
+    assert not (tmp_path / "short.mp4").exists()
