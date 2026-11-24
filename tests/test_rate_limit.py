@@ -1,3 +1,5 @@
+import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -9,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import rate_limit
 from app.core.config import settings
 from app.core.rate_limit import Rule, client_key, email_key, enforce
-from app.core.redis import redis_client
+from app.core.redis import create_redis_client, redis_client
 from app.crud.password_reset import PASSWORD_RESET_USER_KEY_PREFIX
 from app.crud.session import create_session
 from app.crud.user import create_user
@@ -201,3 +203,27 @@ async def test__enforce__window_starts_at_the_first_request(rate_limits_on: None
 
     # A fixed window: a later request does not push the end out to a fresh 100 seconds.
     assert 0 < await redis_client.ttl("rl:window_test:key") <= 10
+
+
+async def test__enforce__a_redis_that_does_not_answer_fails_open_within_the_timeout(
+    monkeypatch: pytest.MonkeyPatch, rate_limits_on: None
+) -> None:
+    async def never_answer(_reader: asyncio.StreamReader, _writer: asyncio.StreamWriter) -> None:
+        await asyncio.sleep(30)
+
+    server = await asyncio.start_server(never_answer, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(settings, "REDIS_SOCKET_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(settings, "REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", 0.3)
+    hanging = create_redis_client(f"redis://127.0.0.1:{port}/0")
+    monkeypatch.setattr(rate_limit, "redis_client", hanging)
+    try:
+        started = time.monotonic()
+        await enforce(rate_limit.LOGIN_IP, "key")
+        elapsed = time.monotonic() - started
+    finally:
+        await hanging.aclose()
+        server.close()
+
+    # Without the timeouts redis-py waits its default 5 seconds.
+    assert elapsed < 2

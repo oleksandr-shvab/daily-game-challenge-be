@@ -26,8 +26,8 @@ Rate limits (M1-42, SPEC decision 80): `app/core/rate_limit.py` is a fixed-windo
 | `password_change` | `POST /v1/auth/update-password` (user id), `POST /v1/auth/reset-password` (IP) | user id or IP | 10 (`RATE_LIMIT_PASSWORD_CHANGE`) | 1 hour |
 
 - `forgot_email` is the only silent rule: over the count the route returns the same 202 and sends nothing. Every other rule answers 429.
-- Redis failing lets the request through (logged as a warning): a limiter must not take the site down.
-- `RATE_LIMITS_ENABLED` (default true) is switched off for every test by an autouse fixture in `tests/conftest.py`; `tests/test_rate_limit.py` asks for the `rate_limits_on` fixture and sets small counts. The frontend's e2e config raises every count, because its suite uses one address.
+- Redis failing lets the request through (logged as a warning): a limiter must not take the site down. The client in `app/core/redis.py` (`create_redis_client`, shared with sessions and `/readyz`) has `REDIS_SOCKET_TIMEOUT_SECONDS` and `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` (1 second each; redis-py's default is 5), so a hanging Redis costs a request one second. A session call to a Redis that needs more than a second for one command fails instead of waiting.
+- `RATE_LIMITS_ENABLED` (default true; staging and production refuse to start with it false) is switched off for every test by an autouse fixture in `tests/conftest.py`; `tests/test_rate_limit.py` asks for the `rate_limits_on` fixture and sets small counts. The frontend's e2e config raises every count, because its suite uses one address.
 - Per-IP limits need the real client address in `request.client`. Behind Caddy that works because uvicorn runs with `--proxy-headers --forwarded-allow-ips '*'` (see the Docker image under "Commands"), and Caddy sets `X-Forwarded-For` itself. Without it every visitor shares the proxy's address and the first ten logins a minute lock everyone out.
 - Redis must not evict keys (`noeviction`), or a counter can vanish early.
 - The guest answer oracle (a guest's guess stores nothing, so a script can try titles until one is right) is accepted; `guess_ip` only makes it slow.

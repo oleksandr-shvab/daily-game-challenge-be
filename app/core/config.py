@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     # A different database from REDIS_URL, so a test run never touches a dev server's sessions.
     TEST_REDIS_URL: str = "redis://localhost:6379/1"
 
+    # Each Redis call waits at most this long (sessions and the rate limiter share the client), so
+    # a Redis that is down or hanging costs a request one second, not redis-py's default five.
+    REDIS_SOCKET_TIMEOUT_SECONDS: float = Field(default=1.0, gt=0)
+    REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: float = Field(default=1.0, gt=0)
+
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 5
     DB_POOL_TIMEOUT_SECONDS: int = 10
@@ -186,6 +191,8 @@ class Settings(BaseSettings):
                 )
             if not is_https(self.FRONTEND_URL):
                 problems.append("FRONTEND_URL must use https")
+            if not self.RATE_LIMITS_ENABLED:
+                problems.append("RATE_LIMITS_ENABLED must not be false")
             for origin in self.BACKEND_CORS_ORIGINS:
                 if origin == "*" or "localhost" in origin or "127.0.0.1" in origin:
                     problems.append(f"BACKEND_CORS_ORIGINS must not contain {origin!r}")
