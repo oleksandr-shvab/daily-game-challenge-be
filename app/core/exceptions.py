@@ -43,6 +43,18 @@ class IncorrectPasswordError(AppException):
     detail = "Incorrect password"
 
 
+class TooManyRequestsError(AppException):
+    """A rate limit was hit. `retry_after` (whole seconds) becomes the `Retry-After` header."""
+
+    status_code = 429
+    code = "too_many_requests"
+    detail = "Too many requests"
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__()
+        self.retry_after = retry_after
+
+
 class ServiceUnavailableError(AppException):
     status_code = 503
     code = "service_unavailable"

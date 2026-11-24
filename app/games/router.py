@@ -1,10 +1,11 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Path, Query, Response
+from fastapi import APIRouter, Path, Query, Request, Response
 
 from app.api.deps import CurrentUser, MediaStorageDep, OptionalUser, SessionDep
 from app.core.clock import NowDep, utc_today
-from app.core.errors import ProblemDetails
+from app.core.errors import RATE_LIMITED_RESPONSE, ProblemDetails
+from app.core.rate_limit import GUESS_IP, SEARCH_IP, client_key, enforce
 from app.games import service
 from app.games.schemas import (
     WHOLE_NUMBER,
@@ -48,6 +49,7 @@ GUESS_ERRORS: dict[int | str, dict[str, Any]] = {
             "`title_not_found`, `duplicate_guess` or `invalid_guess_history`"
         ),
     },
+    **RATE_LIMITED_RESPONSE,
     503: {
         "model": ProblemDetails,
         "description": (
@@ -184,15 +186,21 @@ async def list_archive(
     )
 
 
-@router.get("/{slug}/titles", response_model=TitleList, responses=GAME_NOT_FOUND)
+@router.get(
+    "/{slug}/titles",
+    response_model=TitleList,
+    responses={**GAME_NOT_FOUND, **RATE_LIMITED_RESPONSE},
+)
 async def search_titles(
     slug: Slug,
     db: SessionDep,
+    request: Request,
     response: Response,
     q: Annotated[
         str, Query(max_length=100, description="Text to find in a title's name or franchise")
     ],
 ) -> TitleList:
+    await enforce(SEARCH_IP, client_key(request))
     set_cache_control(response, PUBLIC_CACHE)
     return await service.search_titles(db, slug=slug, query=q)
 
@@ -203,12 +211,14 @@ async def submit_guess(
     date: Annotated[StrictDate, Path(description="A day as YYYY-MM-DD")],
     body: GuessCreate,
     db: SessionDep,
+    request: Request,
     response: Response,
     now: NowDep,
     user: OptionalUser,
     storage: MediaStorageDep,
     variant: Variant = None,
 ) -> PuzzleView:
+    await enforce(GUESS_IP, client_key(request))
     set_cache_control(response, PRIVATE_NO_STORE)
     return await service.submit_guess(
         db,

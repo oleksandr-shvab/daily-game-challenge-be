@@ -125,6 +125,19 @@ class Settings(BaseSettings):
 
     BACKEND_CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
+    # Fixed-window limits kept in Redis (`app/core/rate_limit.py`). The windows are in code; these
+    # are the counts. The frontend's e2e config raises them, because its suite registers and logs
+    # in from one address.
+    RATE_LIMITS_ENABLED: bool = True
+    RATE_LIMIT_LOGIN_PER_IP: int = Field(default=10, ge=1)
+    RATE_LIMIT_LOGIN_PER_EMAIL: int = Field(default=10, ge=1)
+    RATE_LIMIT_REGISTER_PER_IP: int = Field(default=10, ge=1)
+    RATE_LIMIT_FORGOT_PER_IP: int = Field(default=10, ge=1)
+    RATE_LIMIT_FORGOT_PER_EMAIL: int = Field(default=3, ge=1)
+    RATE_LIMIT_GUESS_PER_IP: int = Field(default=60, ge=1)
+    RATE_LIMIT_SEARCH_PER_IP: int = Field(default=120, ge=1)
+    RATE_LIMIT_PASSWORD_CHANGE: int = Field(default=10, ge=1)
+
     MEDIA_STORAGE: Literal["local", "s3"] = "local"
     MEDIA_LOCAL_DIR: str = "var/media"
     # The dev default goes through the frontend's proxy, so a link loads with no CORS and no
