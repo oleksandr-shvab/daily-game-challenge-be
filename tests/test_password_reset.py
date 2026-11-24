@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from httpx import AsyncClient
 from pydantic import ValidationError
@@ -5,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import service
 from app.auth.schemas import ResetPasswordRequest
+from app.core.config import settings
+from app.core.email import send_password_reset_email
 from app.core.exceptions import InvalidOrExpiredResetTokenError
 from app.core.redis import redis_client
 from app.crud.password_reset import (
@@ -76,3 +80,25 @@ async def test__reset_password__revokes_all_sessions(db_session: AsyncSession) -
 def test__reset_password_request__mismatched_passwords_raises() -> None:
     with pytest.raises(ValidationError):
         ResetPasswordRequest(token="x", new_password="NewPass123", confirm_password="Different123")
+
+
+@pytest.mark.parametrize(
+    ("environment", "is_logged"),
+    [("local", True), ("test", True), ("staging", False), ("production", False)],
+)
+async def test__send_password_reset_email__logs_link_only_in_local_and_test(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    environment: str,
+    is_logged: bool,
+) -> None:
+    email = "logged@example.com"
+    link = "http://localhost:5173/reset-password?token=abc123"
+    monkeypatch.setattr(settings, "ENVIRONMENT", environment)
+
+    with caplog.at_level(logging.INFO, logger="app.core.email"):
+        await send_password_reset_email(email, link)
+
+    # The frontend e2e suite reads this line by the email and the link.
+    assert (email in caplog.text) is is_logged
+    assert (link in caplog.text) is is_logged
