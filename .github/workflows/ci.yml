@@ -135,3 +135,30 @@ jobs:
           fail-on: ERR
           # Do not upload the specs to oasdiff.com.
           review: "false"
+
+  # Builds the server image and checks it. Nothing is pushed; Compose lives in the platform repo.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t dgc-backend:ci .
+      - name: Image checks
+        run: |
+          # Not root: the image's own user, uid 10001. The value is captured first,
+          # because bash -e ignores a failure inside $(...) used as a test argument.
+          uid=$(docker run --rm dgc-backend:ci id -u)
+          test "$uid" = 10001
+          # No content or dev libraries (Pillow, PyAV, httpx). An explicit exit,
+          # because bash -e does not stop on a command negated with !.
+          for mod in PIL av httpx; do
+            if docker run --rm dgc-backend:ci python -c "import $mod"; then
+              echo "::error::$mod is in the runtime image"
+              exit 1
+            fi
+          done
+          # The server imports only what the runtime install has.
+          docker run --rm -e ENVIRONMENT=test \
+            -e DATABASE_URL=postgresql+asyncpg://u:p@db/x \
+            -e SECRET_KEY=ci-only-secret-key-not-used-anywhere-0000 \
+            dgc-backend:ci python -c "import app.main"

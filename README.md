@@ -46,6 +46,10 @@ TEST_REDIS_URL=redis://localhost:6390/1 \
 uv run pytest -q
 ```
 
+## Docker image
+
+`docker build -t dgc-backend:ci .` builds the server image: runtime dependencies only, run as a non-root user. The production Compose file is in the platform repo.
+
 ## Lint and the API contract
 
 ```
