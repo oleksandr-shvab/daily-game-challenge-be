@@ -135,3 +135,22 @@ jobs:
           fail-on: ERR
           # Do not upload the specs to oasdiff.com.
           review: "false"
+
+  # Builds the server image and checks it. Nothing is pushed; Compose lives in the platform repo.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t dgc-backend:ci .
+      - name: Image checks
+        run: |
+          # Not root.
+          test "$(docker run --rm dgc-backend:ci id -u)" != 0
+          # No content libraries (Pillow, PyAV).
+          ! docker run --rm dgc-backend:ci python -c "import PIL"
+          # The server imports only what the runtime install has.
+          docker run --rm -e ENVIRONMENT=test \
+            -e DATABASE_URL=postgresql+asyncpg://u:p@db/x \
+            -e SECRET_KEY=ci-only-secret-key-not-used-anywhere-0000 \
+            dgc-backend:ci python -c "import app.main"
