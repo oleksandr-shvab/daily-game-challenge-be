@@ -12,6 +12,26 @@ Dependency management runs on uv: direct dependencies are in `pyproject.toml` (r
 
 Errors, health and config (2026-10-27): every error body follows the contract in `../CONTRACTS.md` ("Errors"): raise an `AppException` subclass with a `code` (`app/core/exceptions.py`), never an English-only `detail`; handlers live in `app/core/errors.py` and every response carries `X-Request-ID`. `GET /healthz` and `GET /readyz` exist (`app/api/health.py`). `ENVIRONMENT` is `local`, `test`, `staging` or `production`; every environment refuses to start when `FRONTEND_URL` is not an absolute http(s) URL, and `local` and `test` also when `API_BASE_URL` or any `BACKEND_CORS_ORIGINS` entry is not (they feed the allowed origins there only); `staging` and `production` additionally refuse a placeholder `SECRET_KEY`, a non-https `FRONTEND_URL` or localhost CORS origins (`app/core/config.py`). Passwords use argon2id (`app/core/security.py`, async wrappers). The test suite points the app at `TEST_DATABASE_URL` and `TEST_REDIS_URL` (it drops tables and flushes that Redis database, so both must differ from the dev ones). CI is `.github/workflows/ci.yml` (lint, test, migrations, openapi). The API is mounted under `/v1`; `openapi/openapi.json` is the contract snapshot the frontend generates its types from: after changing any route or schema run `uv run python scripts/export_openapi.py` and commit it (a test and CI fail otherwise); a breaking change needs the `breaking-change` pull request label.
 
+Rate limits (M1-42, SPEC decision 80): `app/core/rate_limit.py` is a fixed-window counter in Redis, with no dependency. A route calls `await enforce(RULE, key)` first thing in its handler (so a malformed body is a 422 and is not counted). `enforce` runs `INCR`, `EXPIRE ... NX` and `TTL` in one transaction on `rl:<rule>:<key>`; over the count it raises `TooManyRequestsError`, which the handler in `app/core/errors.py` turns into a 429 `too_many_requests` with `Retry-After` (seconds left in the window). Keys hold an IP (an IPv6 address counts as its /64) or the SHA-256 of the lower-cased email, never an address. The counts are settings, the windows are in code:
+
+| Rule | Route | Key | Count (setting) | Window |
+|---|---|---|---|---|
+| `login_ip` | `POST /v1/auth/login` | IP | 10 (`RATE_LIMIT_LOGIN_PER_IP`) | 1 min |
+| `login_email` | `POST /v1/auth/login` | email hash | 10 (`RATE_LIMIT_LOGIN_PER_EMAIL`) | 15 min |
+| `register_ip` | `POST /v1/auth/register` | IP | 10 (`RATE_LIMIT_REGISTER_PER_IP`) | 1 hour |
+| `forgot_ip` | `POST /v1/auth/forgot-password` | IP | 10 (`RATE_LIMIT_FORGOT_PER_IP`) | 1 hour |
+| `forgot_email` | `POST /v1/auth/forgot-password` | email hash | 3 (`RATE_LIMIT_FORGOT_PER_EMAIL`) | 1 hour |
+| `guess_ip` | `POST /v1/games/{slug}/puzzles/{date}/guesses` | IP | 60 (`RATE_LIMIT_GUESS_PER_IP`) | 1 min |
+| `search_ip` | `GET /v1/games/{slug}/titles` | IP | 120 (`RATE_LIMIT_SEARCH_PER_IP`) | 1 min |
+| `password_change` | `POST /v1/auth/update-password` (user id), `POST /v1/auth/reset-password` (IP) | user id or IP | 10 (`RATE_LIMIT_PASSWORD_CHANGE`) | 1 hour |
+
+- `forgot_email` is the only silent rule: over the count the route returns the same 202 and sends nothing. Every other rule answers 429.
+- Redis failing lets the request through (logged as a warning): a limiter must not take the site down. The client in `app/core/redis.py` (`create_redis_client`, shared with sessions and `/readyz`) has `REDIS_SOCKET_TIMEOUT_SECONDS` and `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` (1 second each; redis-py's default is 5), so a hanging Redis costs a request one second. A session call to a Redis that needs more than a second for one command fails instead of waiting.
+- `RATE_LIMITS_ENABLED` (default true; staging and production refuse to start with it false) is switched off for every test by an autouse fixture in `tests/conftest.py`; `tests/test_rate_limit.py` asks for the `rate_limits_on` fixture and sets small counts. The frontend's e2e config raises every count, because its suite uses one address.
+- Per-IP limits need the real client address in `request.client`. Behind Caddy that works because uvicorn runs with `--proxy-headers --forwarded-allow-ips '*'` (see the Docker image under "Commands"), and Caddy sets `X-Forwarded-For` itself. Without it every visitor shares the proxy's address and the first ten logins a minute lock everyone out.
+- Redis must not evict keys (`noeviction`), or a counter can vanish early.
+- The guest answer oracle (a guest's guess stores nothing, so a script can try titles until one is right) is accepted; `guess_ip` only makes it slow.
+
 ## Commands
 
 Install uv (https://docs.astral.sh/uv/), then set up the venv (Python 3.12, from `.python-version`; uv downloads it if the system has another):

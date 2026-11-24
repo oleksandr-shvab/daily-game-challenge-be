@@ -113,6 +113,12 @@ def set_now() -> Generator[SetNow, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def rate_limits_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test calls routes from one address; `tests/test_rate_limit.py` turns the limits on."""
+    monkeypatch.setattr(settings, "RATE_LIMITS_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 async def clean_redis() -> AsyncGenerator[None, None]:
     yield
     # Safe: the client points at TEST_REDIS_URL, not the dev Redis.

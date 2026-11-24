@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.exceptions import AppException, RangeNotSatisfiableError
+from app.core.exceptions import AppException, RangeNotSatisfiableError, TooManyRequestsError
 from app.core.request_id import REQUEST_ID_HEADER, new_request_id
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,20 @@ class ProblemDetails(BaseModel):
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     422: {"model": ProblemDetails, "description": "Validation error"},
     500: {"model": ProblemDetails, "description": "Unexpected error"},
+}
+
+# For the routes that call `enforce` (`app/core/rate_limit.py`).
+RATE_LIMITED_RESPONSE: dict[int | str, dict[str, Any]] = {
+    429: {
+        "model": ProblemDetails,
+        "description": "`too_many_requests`: wait the number of seconds in `Retry-After`",
+        "headers": {
+            "Retry-After": {
+                "description": "Seconds until the limit's window ends",
+                "schema": {"type": "integer"},
+            }
+        },
+    }
 }
 
 HTTP_STATUS_CODES = {
@@ -180,6 +194,16 @@ async def range_not_satisfiable_handler(
     )
 
 
+async def too_many_requests_handler(request: Request, exc: TooManyRequestsError) -> JSONResponse:
+    return problem_response(
+        request,
+        exc.status_code,
+        exc.code,
+        exc.detail,
+        headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
@@ -213,6 +237,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(TooManyRequestsError, too_many_requests_handler)  # type: ignore[arg-type]
     app.add_exception_handler(AppException, app_exception_handler)  # type: ignore[arg-type]
     app.add_exception_handler(RangeNotSatisfiableError, range_not_satisfiable_handler)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, validation_exception_handler)  # type: ignore[arg-type]

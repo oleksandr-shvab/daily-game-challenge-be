@@ -159,6 +159,21 @@ def test__s3_settings__an_endpoint_that_is_not_a_clean_http_url_refuses_to_boot(
         Settings(**{**DEPLOYED, **S3, "ENVIRONMENT": environment, "S3_ENDPOINT_URL": endpoint})  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test__deployed_settings__rate_limits_cannot_be_switched_off(environment: str) -> None:
+    deployed = {**DEPLOYED, "ENVIRONMENT": environment}
+
+    assert Settings(**deployed).RATE_LIMITS_ENABLED
+    with pytest.raises(ValidationError, match="RATE_LIMITS_ENABLED"):
+        Settings(**deployed, RATE_LIMITS_ENABLED=False)
+
+
+def test__local_settings__rate_limits_can_be_switched_off() -> None:
+    local = {"ENVIRONMENT": "local", "DATABASE_URL": DEPLOYED["DATABASE_URL"], "SECRET_KEY": "s"}
+
+    assert not Settings(**local, RATE_LIMITS_ENABLED=False).RATE_LIMITS_ENABLED
+
+
 def test__production_settings__safe_values_boot() -> None:
     assert Settings(**DEPLOYED).is_deployed
     # The bounds are inclusive, and S3 needs no signing key of its own.
@@ -175,6 +190,7 @@ def test__production_settings__safe_values_boot() -> None:
         {"SECRET_KEY": "too-short"},
         {"FRONTEND_URL": "http://example.com"},
         {"BACKEND_CORS_ORIGINS": ["http://localhost:5173"]},
+        {"RATE_LIMITS_ENABLED": False},
         # Local media storage can be real in production, so its links need a real key and https.
         {"MEDIA_SIGNING_KEY": "change-me"},
         {"MEDIA_SIGNING_KEY": "too-short"},
