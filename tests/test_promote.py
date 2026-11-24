@@ -633,6 +633,16 @@ def test__local_media_writer__says_yes_or_no_and_is_never_unknown(tmp_path: Path
     assert writer.exists_or_unknown(key) is True
 
 
+def test__local_media_writer__stores_a_file_the_server_user_can_read(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"clue")
+    key = hashlib.sha256(b"clue").hexdigest()
+
+    LocalMediaWriter(tmp_path / "storage").put(key, source, "image/webp")
+
+    assert (tmp_path / "storage" / key).stat().st_mode & 0o777 == 0o644
+
+
 # (c) Files go first; a failing write rolls the rows back ---------------------------------------
 
 

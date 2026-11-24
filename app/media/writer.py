@@ -65,6 +65,9 @@ def write_atomically(path: Path, write: Callable[[BinaryIO], None]) -> None:
     try:
         with os.fdopen(handle, "wb") as out:
             write(out)
+        # mkstemp makes the file 0600, and os.replace keeps that. The server may run as another
+        # user (the Docker image runs as uid 10001) and only reads the file, so make it readable.
+        os.chmod(temp_name, 0o644)
         os.replace(temp_name, path)
     except BaseException:
         Path(temp_name).unlink(missing_ok=True)
