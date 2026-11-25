@@ -1,8 +1,8 @@
 # Daily Game Challenge backend
 
-The FastAPI backend of Daily Game Challenge, a site with daily puzzle games. The package is `daily-game-challenge-be`; the repo keeps the name `my-list-be`. The frontend is the sibling repo `my-list-fe`. The contract between the two is `CONTRACTS.md` in the parent platform folder.
+The FastAPI backend of Daily Game Challenge, a site with daily puzzle games. The frontend is [daily-game-challenge-fe](https://github.com/oleksandr-shvab/daily-game-challenge-fe); the overview, architecture, API contract and production setup are in the umbrella repo [daily-game-challenge](https://github.com/oleksandr-shvab/daily-game-challenge). Locally the three sit together, this one checked out as `my-list-be/` inside the umbrella repo (its scripts and Compose files use that path).
 
-Today the backend has accounts (register, login, logout, password reset and update), health checks and the OpenAPI snapshot. The games come in Phase 1.
+It has accounts with server-side sessions (register, login, logout, password reset and update), the game guesser (today's puzzle, title search, guesses, account progress, stats and streaks, the archive, the guest merge), clue media behind signed links with byte ranges, rate limits, a CSRF origin check, health checks and the OpenAPI snapshot the frontend's types are generated from. The content scripts build puzzles from IGDB and Steam data, and a local review page approves them.
 
 ## What you need
 
