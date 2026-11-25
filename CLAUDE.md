@@ -87,7 +87,7 @@ The FastAPI backend of Daily Game Challenge, a site with daily puzzle games (pro
 This is a learning/practice project built deliberately with production-grade patterns — the goal is real-world architecture, not shortcuts.
 
 ## This repo
-FastAPI backend only. The frontend is the sibling repo `../my-list-fe`, a Vite/React SPA running at `http://localhost:5173` in dev.
+FastAPI backend only. The frontend is the sibling repo `../my-list-fe`, a Vite/React SPA running at `http://localhost:5173` in dev. On GitHub the repos are `oleksandr-shvab/daily-game-challenge-be` (this one), `daily-game-challenge-fe` and the umbrella `daily-game-challenge`; locally they keep the folder names `my-list-be/` and `my-list-fe/`, which scripts, Compose and CI paths rely on.
 
 ## Stack
 - FastAPI, Python 3.12, managed with **uv** (`pyproject.toml` + `uv.lock`, `.venv` created by `uv sync`)
